@@ -1,0 +1,15 @@
+﻿# LocalLLM Studio 실행 의존성
+# fastapi 하한은 FastAPI(lifespan=...) 때문(0.93.0 도입, main.py). 나머지 사용부는
+# 훨씬 구버전에도 있으므로 사내 미러에 있는 버전에 맞춰 하한을 낮춰 잡았다.
+# 미러 버전이 0.93 미만이면 lifespan을 구식 startup/shutdown 이벤트로 바꿔야 한다.
+fastapi>=0.95
+uvicorn>=0.29
+openai>=1.30
+mcp>=1.0
+
+# 선택: 첨부 파일 텍스트 추출 (없어도 앱은 동작, 해당 형식만 비활성)
+pypdf>=4.0
+python-docx>=1.1
+
+# 빌드 전용 (exe로 묶을 때만 필요)
+# pyinstaller>=6.6

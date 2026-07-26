@@ -1,0 +1,39 @@
+﻿# mcp_server/ 안의 MCP 서버들(office/outlook/catia/rag) 실행 의존성.
+# llm_studio는 자체 requirements.txt를 따로 가진다 (llm_studio/requirements.txt).
+#
+# 폐쇄망 설치:
+#     pip install -r requirements.txt
+# 사내 PyPI 미러를 명시해야 하면:
+#     pip install -r requirements.txt -i http://<사내미러>/simple --trusted-host <사내미러>
+
+# MCP 서버 프레임워크 — office_server.py / outlook_server.py가 사용.
+# 개발 PC 검증 버전은 3.4.4. transport="http"/"sse" 인자 이름이 2.x와 다르므로 3.x가 필요하다.
+# 주의: 사내 미러에 없거나 2.x만 있으면 두 서버 모두 import 단계에서 실패한다. 반입 전 확인 필요.
+fastmcp>=3.0
+
+# Office/Outlook COM 자동화 (Windows 전용).
+# 없으면 서버는 뜨지만 모든 도구가 안내 메시지만 반환한다 (COM_AVAILABLE 가드).
+pywin32; sys_platform == "win32"
+
+# llm_studio/serve_llm.py는 표준 라이브러리(subprocess/urllib)만 쓰므로 추가 의존성이 없다.
+# 대신 llama-server 실행 파일과 .gguf 모델을 별도로 반입해야 한다 (docstring 참고).
+
+# pdf_server.py — DRM PDF 텍스트 추출. 평문 PDF의 direct 백엔드에 pypdf를 쓴다.
+# 없으면 direct/reader_print 백엔드가 비활성화되고, DRM PDF는 word_com(pywin32+Word)
+# 백엔드로만 읽는다 (우아한 저하 — 서버는 정상 기동). 사내 미러 등록 여부 확인 필요.
+pypdf>=4.0
+
+# RAG(rag_core.py)의 벡터 저장소 — Qdrant 로컬(파일) 모드 (서버 프로세스 불필요).
+# 사내 미러에 등록돼 있음. 없으면 sqlite BLOB 벡터로 우아하게 저하한다
+# (죽지 않음 — 단 대규모 코퍼스에서 검색이 느려진다).
+qdrant-client
+
+# numpy는 선택 의존성 — qdrant가 없어 sqlite 벡터로 저하했을 때 코사인 계산을
+# 빠르게 한다 (qdrant-client가 설치되면 그 의존성으로 어차피 따라온다).
+# numpy
+
+# ansys_server.py — ANSYS MAPDL 열해석 (PyMAPDL, gRPC). 사내 미러 등록 여부가
+# 미확인이라 기본 설치 목록에서는 뺀다(확인 후 주석 해제 또는 개별 설치).
+# 없으면 서버는 뜨되 모든 도구가 안내만 반환한다 (우아한 저하).
+# ANSYS MAPDL 본체 + 라이선스도 별도로 필요하다 (PyMAPDL은 클라이언트일 뿐).
+# ansys-mapdl-core

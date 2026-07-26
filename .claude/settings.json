@@ -1,0 +1,26 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python test_outlook.py)",
+      "Bash(python test_outlook.py --*)",
+      "Bash(python office_server.py --*)",
+      "Bash(python outlook_server.py --*)",
+      "Bash(python serve_llm.py --*)",
+      "Bash(python app.py --mock)",
+      "Bash(python -m py_compile:*)",
+      "Bash(python -c \"import fastmcp*\")",
+      "Bash(pip install -r requirements.txt)",
+      "Bash(pip install -r llm_studio/requirements.txt)",
+      "Bash(pip index versions:*)",
+      "Bash(git status)",
+      "Bash(git diff:*)",
+      "Bash(git log:*)",
+      "Bash(git ls-files:*)",
+      "Bash(git show:*)"
+    ],
+    "ask": [
+      "Bash(git push:*)",
+      "Bash(build_exe.bat)"
+    ]
+  }
+}

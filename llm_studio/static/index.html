@@ -1,0 +1,213 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>LocalLLM Studio</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<div id="app">
+  <aside id="sidebar">
+    <div class="sidebar-head">
+      <div class="logo">LocalLLM Studio</div>
+      <button id="newChatBtn" class="btn primary">+ 새 대화</button>
+    </div>
+    <ul id="convList"></ul>
+    <div class="sidebar-foot">
+      <div class="status-line">
+        <span id="statusDot" class="dot"></span>
+        <span id="statusText">연결 확인 중…</span>
+      </div>
+      <div class="status-line small" id="mcpText"></div>
+      <div class="foot-btns">
+        <button id="settingsBtn" class="btn">⚙ 설정</button>
+        <button id="shutdownBtn" class="btn danger" title="이 앱 서버(웹 UI + 로컬 LLM)를 종료합니다">⏻ 호스팅 종료</button>
+      </div>
+    </div>
+  </aside>
+
+  <main id="main">
+    <header id="chatHeader">
+      <span id="convTitle">새 대화</span>
+      <select id="providerSelect" title="응답에 사용할 모델 (로컬 또는 외부 API)"></select>
+    </header>
+    <!-- 로컬 모델 미실행 시 뜨는 셋업 바 — 여기서 바로 모델을 골라 서빙을 시작한다.
+         외부 서버가 설정돼 있으면 [연결] 버튼으로 바뀐다. 서빙이 시작되면 숨는다. -->
+    <div id="localSetup" class="setup-bar hidden">
+      <span class="setup-icon">🖥</span>
+      <span id="setupText" class="setup-text">로컬 모델이 실행되고 있지 않습니다.</span>
+      <select id="setupModel" title="서빙할 GGUF 모델"></select>
+      <button id="setupRefreshBtn" class="btn icon" title="모델 목록 새로고침">↻</button>
+      <button id="setupStartBtn" class="btn primary">서빙 시작</button>
+      <button id="setupSettingsBtn" class="btn">설정</button>
+      <span id="setupMsg" class="hint"></span>
+    </div>
+    <div id="messages">
+      <div id="emptyHint">
+        <h2>무엇을 도와드릴까요?</h2>
+        <p>메시지를 입력하면 대화가 시작됩니다. 📎 버튼으로 문서를 첨부해 내용을 질의할 수 있습니다.</p>
+      </div>
+    </div>
+    <div id="composer">
+      <div id="attachChips"></div>
+      <div id="genStatus" class="gen-status hidden"></div>
+      <div class="composer-row">
+        <button id="taskModeBtn" class="btn icon" title="작업 모드: 계획을 세우고 단계별로 실행 (다단계 작업에 유리)">🧭</button>
+        <button id="pickFileBtn" class="btn icon" title="문서 첨부 — 파일을 골라 원본 경로로 읽습니다 (복사 안 함, DRM 문서 지원)">📁</button>
+        <!-- 원격(비-localhost) 접속에선 서버 대화상자를 못 띄우므로 브라우저 업로드로 폴백 -->
+        <input type="file" id="fallbackFile" hidden multiple>
+        <textarea id="input" rows="1"
+          placeholder="메시지를 입력하세요 (Enter: 전송, Shift+Enter: 줄바꿈)"></textarea>
+        <button id="sendBtn" class="btn primary">전송</button>
+      </div>
+    </div>
+  </main>
+
+  <!-- 설정 모달 — 좌측 세로 탭(대화·프롬프트 / LLM 연결 / MCP 도구)으로 나뉜다.
+       탭 전환은 패널의 display 토글만 한다(모든 패널은 DOM에 남아 있어 숨은 입력값도
+       collectSettings가 그대로 읽는다). 저장 버튼은 어느 탭에서든 보이도록 하단 푸터에 둔다. -->
+  <div id="settingsModal" class="modal-backdrop hidden">
+    <div class="modal settings-modal">
+      <div class="modal-head">
+        <h3>설정</h3>
+        <button id="settingsClose" class="btn icon">✕</button>
+      </div>
+      <div class="settings-layout">
+        <nav id="settingsTabs" class="settings-tabs">
+          <button class="settings-tab active" data-tab="chat">💬 대화·프롬프트</button>
+          <button class="settings-tab" data-tab="llm">🖥 LLM 연결</button>
+          <button class="settings-tab" data-tab="mcp">🔧 MCP 도구</button>
+        </nav>
+        <div class="modal-body">
+          <!-- 탭 1: 대화·프롬프트 -->
+          <div class="tab-panel active" data-panel="chat">
+            <section>
+              <h4>시스템 프롬프트</h4>
+              <textarea id="setSystemPrompt" rows="4"></textarea>
+            </section>
+            <section>
+              <h4>생성 파라미터 <span class="hint">(저장 즉시 적용)</span></h4>
+              <div class="grid2">
+                <label>temperature <input type="number" id="setTemperature" step="0.05" min="0" max="2"></label>
+                <label>top_p <input type="number" id="setTopP" step="0.01" min="0" max="1"></label>
+                <label>top_k <input type="number" id="setTopK" step="1" min="0"></label>
+                <label>최대 토큰 <input type="number" id="setMaxTokens" step="256" min="256"></label>
+                <label>도구 호출 상한 <span class="hint">(한 턴당 라운드)</span>
+                  <input type="number" id="setMaxToolRounds" step="1" min="1"></label>
+              </div>
+              <label class="check"><input type="checkbox" id="setApprovalEnabled">
+                위험 도구 실행 전 승인 받기 <span class="hint">(발송·삭제 등 confirm 도구를 실행하기 전에 승인/거절 버튼이 뜹니다)</span></label>
+            </section>
+          </div>
+
+          <!-- 탭 2: LLM 연결 (로컬 서빙 + 외부 API) -->
+          <div class="tab-panel" data-panel="llm">
+            <section>
+              <h4>로컬 LLM 서버 <span class="hint">(모델을 골라 서빙을 시작/중지합니다)</span></h4>
+              <div id="serveStatus" class="serve-status"></div>
+              <label>연결 방식
+                <select id="setLlamaMode">
+                  <option value="managed">이 앱이 직접 실행 (GGUF 선택)</option>
+                  <option value="external">외부 서버에 연결 (serve_llm.py 등)</option>
+                </select>
+              </label>
+
+              <div id="managedFields">
+                <label>모델 파일
+                  <div class="row inline">
+                    <select id="setModelSelect"></select>
+                    <button id="refreshModelsBtn" class="btn icon" title="목록 새로고침">↻</button>
+                  </div>
+                </label>
+                <label id="modelPathManual" class="hidden">직접 경로 입력
+                  <input type="text" id="setModelPath" placeholder="C:\ProgramData\LocalLLMStudio\models\model.gguf"></label>
+                <div class="grid2">
+                  <label>모델 별칭(alias) <input type="text" id="setModelAlias" placeholder="gemma-12b-it-qat"></label>
+                  <label>GPU 레이어 (-ngl) <span class="hint">99=전부, 0=CPU</span>
+                    <input type="number" id="setGpuLayers" step="1" min="0"></label>
+                  <label>컨텍스트 길이 <input type="number" id="setCtx" step="4096" min="4096"></label>
+                  <label class="check"><input type="checkbox" id="setKvQuant"> KV 캐시 양자화 (VRAM 절약)</label>
+                </div>
+              </div>
+
+              <div id="externalFields" class="hidden">
+                <label>외부 서버 주소
+                  <input type="text" id="setExternalUrl" placeholder="http://127.0.0.1:8000"></label>
+                <p class="hint">이미 떠 있는 llama-server(serve_llm.py 등)에 붙습니다. 앱을 껐다 켜도 그 서버는 유지됩니다.</p>
+              </div>
+
+              <label class="check"><input type="checkbox" id="setAutostart"> 앱 시작 시 이 설정으로 자동 서빙</label>
+
+              <div class="row">
+                <button id="startServeBtn" class="btn primary">서빙 시작</button>
+                <button id="stopServeBtn" class="btn warn">중지</button>
+                <button id="restartBtn" class="btn">재시작</button>
+              </div>
+            </section>
+            <section>
+              <h4>외부 LLM 연결 <span class="hint">(OpenAI 호환 API — 키는 서버 config.json에만 저장, 브라우저에는 남지 않음)</span></h4>
+              <div id="providerRows"></div>
+              <div class="row">
+                <select id="providerPreset">
+                  <option value="custom">직접 입력 (사내 게이트웨이 등)</option>
+                  <option value="openai">OpenAI</option>
+                  <option value="anthropic">Anthropic (Claude)</option>
+                  <option value="gemini">Google Gemini</option>
+                </select>
+                <button id="addProviderBtn" class="btn">+ 연결 추가</button>
+              </div>
+              <p class="hint">chat/completions 규격이면 무엇이든 등록 가능. 저장은 하단 [설정 저장] 버튼으로 함께 저장됩니다.</p>
+            </section>
+          </div>
+
+          <!-- 탭 3: MCP 도구 -->
+          <div class="tab-panel" data-panel="mcp">
+            <section>
+              <h4>MCP 도구 서버</h4>
+              <div id="mcpStatus" class="mcp-status"></div>
+              <div id="mcpRows"></div>
+              <div class="row">
+                <select id="mcpPreset">
+                  <option value="url">HTTP/SSE 서버 (주소로 연결)</option>
+                  <option value="stdio">로컬 명령 (프로세스 실행)</option>
+                </select>
+                <button id="addMcpBtn" class="btn">+ 서버 추가</button>
+              </div>
+              <div class="row">
+                <button id="saveMcpBtn" class="btn primary">MCP 저장 + 재연결</button>
+              </div>
+              <p class="hint">MCP는 위 [MCP 저장 + 재연결] 버튼으로 따로 저장합니다 (하단 [설정 저장]과 별개).</p>
+              <details class="mcp-advanced">
+                <summary>저장될 JSON 미리보기</summary>
+                <textarea id="mcpConfig" rows="8" spellcheck="false" readonly></textarea>
+                <p class="hint">위 폼이 원본입니다. 직접 손보려면 데이터 폴더의 mcp_servers.json을 편집하세요.</p>
+              </details>
+            </section>
+          </div>
+        </div>
+      </div>
+      <!-- 공통 푸터 — 어느 탭에서든 보이는 저장 버튼과 상태 메시지 -->
+      <div class="modal-foot">
+        <p id="settingsMsg" class="hint"></p>
+        <button id="saveSettingsBtn" class="btn primary">설정 저장</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- 저장·완료 등 성공 동작을 잠깐 알리는 토스트 (자동 소멸) -->
+  <div id="toast" class="toast hidden" role="status" aria-live="polite"></div>
+
+  <!-- 호스팅 종료 후 안내 오버레이 -->
+  <div id="shutdownOverlay" class="modal-backdrop hidden">
+    <div class="shutdown-card">
+      <div class="shutdown-icon">⏻</div>
+      <h3>서버가 종료되었습니다</h3>
+      <p>이 앱 서버가 내려갔습니다. 브라우저 탭을 닫으셔도 됩니다.<br>
+         다시 사용하려면 터미널에서 <code>python app.py</code>로 재실행하세요.</p>
+    </div>
+  </div>
+</div>
+<script src="app.js"></script>
+</body>
+</html>

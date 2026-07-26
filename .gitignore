@@ -1,0 +1,46 @@
+# Course example material — not tracked
+Examples/
+
+# Environment / secrets
+.env
+env
+environment
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Runtime-generated state (created by running the bots/labs, not source)
+Examples/slack_threads.db
+Examples/discord_threads.db
+Examples/_test_output/
+
+# 반입물 — 저장소에 넣지 않고 별도 매체로 옮긴다 (GitHub는 파일당 100MB 제한)
+*.gguf
+llm_studio/llama/
+llm_studio/llama-vulkan/
+llm_studio/dist/
+llm_studio/build/
+llm_studio/Output/
+
+# OS
+Thumbs.db
+.DS_Store
+
+# RAG 인덱스 산출물 (rag_server.py가 생성 — 재인덱싱으로 언제든 복구 가능)
+rag_index.db
+rag_vectors/
+
+# RAG 학습에 투입하는 실제 문서 (사내 문서일 수 있어 공개 repo에 넣지 않는다).
+# README만 남기고 나머지 전부 제외.
+rag_docs/*
+!rag_docs/README.md
+
+# 폐쇄망 오프라인 설치용 wheel 모음 (install_requirements.bat이 여기서 설치).
+# .whl은 대용량이고 USB 등으로 반입하므로 git에 넣지 않는다.
+wheelhouse/
