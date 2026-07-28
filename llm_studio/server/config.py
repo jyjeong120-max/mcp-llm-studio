@@ -62,10 +62,25 @@ DEFAULT_CONFIG = {
     "memory_autosummary_enabled": True, # 대화에서 사실을 자동 추출해 저장할지
     "memory_autosummary_turn_interval": 25,   # 이 턴 수마다 자동요약 1회
     "memory_autosummary_char_threshold": 24000,  # 누적 이력이 이 문자수를 넘으면 자동요약
-    # 계획-실행(작업 모드). 요청에 task_mode=True가 오면 다단계로 처리한다.
-    "task_mode_enabled": True,   # 끄면 task_mode 요청도 일반 채팅으로 처리
+    "compact_keep_recent_turns": 4,     # 대화 압축 시 원문으로 남길 최근 user 턴 수 (그 이전은 요약)
+    # 계획-실행(작업 모드) + 실행 코크핏. 요청 mode가 "task"거나, "auto"에서 라우터가
+    # 작업으로 분류하면 다단계로 처리한다. "chat"이면 항상 일반 채팅.
+    "task_mode_enabled": True,   # 끄면 작업 요청도 일반 채팅으로 처리
     "task_max_steps": 10,        # 총 스텝 실행 상한 (무한 루프 방지)
     "task_max_replans": 2,       # 재계획 예산 (실패 시 남은 계획 재수립 횟수)
+    # 의도 라우터: mode="auto"일 때 요청을 작업/채팅으로 자동 분류한다. 끄면 auto는
+    # 채팅으로 처리한다(사용자가 🧭를 눌러 강제 작업으로 돌릴 수 있음).
+    "task_router_enabled": True,
+    # 조종 게이트(반자동). 계획 확정 게이트: 계획 직후 멈춰 확인/편집/취소. 실패 게이트:
+    # 스텝 실패 시 재시도/건너뛰기/재계획/편집/중단을 묻는다. 무응답이면 그대로 진행.
+    # 계획 게이트는 기본 꺼둔다 — 계획마다 승인을 받으면 흐름이 끊겨, 계획을 세우면
+    # 바로 실행한다(위험 도구는 approval 게이트가 실행 직전에 따로 잡는다). 필요하면 켠다.
+    "task_plan_gate": False,
+    "task_failure_gate": True,
+    "task_steer_timeout": 600,   # 조종 대기 상한(초). 0 이하 = 무제한. 초과 시 그대로 진행.
+    # 조건 분기('[?→M]'): 계획가가 분기 태그를 붙이면 조건 판정으로 이후 단계를 건너뛴다.
+    # 끄면 분기 태그를 본문의 일부로 두어 일반 스텝처럼 실행한다.
+    "task_branch_enabled": True,
     # 위험 도구 승인 게이트: 모델이 confirm=true 인자(파괴적 동작의 실제 실행)로 도구를
     # 부르거나 approval_tools에 오른 도구를 부르면, 실행 전에 브라우저에 승인/거절
     # 버튼을 띄워 사용자의 결정을 기다린다. MCP 서버 쪽 confirm 게이트와 이중 안전장치 —

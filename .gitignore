@@ -41,6 +41,16 @@ rag_vectors/
 rag_docs/*
 !rag_docs/README.md
 
+# RAG 임베딩 모델 반입 폴더 (대용량 .gguf / llama-server.exe, USB로 반입).
+# README만 남기고 나머지 전부 제외. (*.gguf는 위에서도 전역 제외됨)
+rag_embed/*
+!rag_embed/README.md
+
+# RAG 리랭커 모델 반입 폴더 (rag_server가 서빙 시 자동 기동, :8002).
+# README만 남기고 나머지 전부 제외.
+rag_rerank/*
+!rag_rerank/README.md
+
 # 폐쇄망 오프라인 설치용 wheel 모음 (install_requirements.bat이 여기서 설치).
 # .whl은 대용량이고 USB 등으로 반입하므로 git에 넣지 않는다.
 wheelhouse/

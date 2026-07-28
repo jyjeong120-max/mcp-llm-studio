@@ -98,7 +98,8 @@ async def run_chat(
 
     base_url은 /v1까지 포함한 OpenAI 호환 엔드포인트 전체 주소.
     send_top_k: llama-server는 top_k를 받지만 OpenAI 등 외부 API는
-    알 수 없는 파라미터로 거절하므로 로컬일 때만 보낸다.
+    알 수 없는 파라미터로 거절하므로 로컬일 때만 보낸다. top_p도 같은 이유로
+    (일부 최신 모델은 top_p deprecated) 이 플래그가 참일 때만 보낸다.
     memory: 주어지면 내장 remember 도구를 노출해 모델이 사실을 저장할 수 있게 한다.
     tool_servers: MCP 도구를 이 서버들로만 좁힌다(서버-스코프). None이면 전체,
     빈 목록이면 MCP 도구 없음. 작업 모드가 스텝마다 필요한 서버만 넘길 때 쓴다.
@@ -132,7 +133,9 @@ async def run_chat(
                 stream=True,
                 tools=tool_specs or NOT_GIVEN,
                 temperature=settings.get("temperature", 1.0),
-                top_p=settings.get("top_p", 0.95),
+                # top_p는 Gemma용 샘플링 값이라 로컬 llama에만 보낸다. 외부 API에는
+                # 넘기지 않는다 — 일부 최신 모델은 top_p를 deprecated로 400을 낸다.
+                top_p=settings.get("top_p", 0.95) if send_top_k else NOT_GIVEN,
                 max_tokens=settings.get("max_tokens", 4096),
                 extra_body={"top_k": settings.get("top_k", 64)} if send_top_k else None,
             )
@@ -375,6 +378,76 @@ def _parse_facts(text: str) -> list[str]:
             if fact and fact != "없음":
                 facts.append(fact)
     return facts
+
+
+# ---------- 대화 압축(컴팩트) ----------
+# 자동요약(extract_memories)과 목적이 다르다: 저쪽은 다음 대화에도 유효할 '사실'을 뽑아
+# 장기 메모리에 저장하고, 이쪽은 이 대화를 '이어가기 위해' 앞부분을 요약으로 줄인다.
+COMPACT_MSG_CHARS = 1500          # 압축 입력에서 메시지 하나당 자르는 한도
+COMPACT_TRANSCRIPT_MAX = 24000    # 요약기에 넣을 대화록 총 길이 상한(요약 호출 자체의 문맥 보호)
+
+_COMPACT_SYSTEM = (
+    "너는 길어진 대화를 계속 이어가기 위해 앞부분을 압축하는 요약기다. "
+    "뒤에 이어질 대화가 문맥을 잃지 않도록, 사용자의 요청·확정된 결정과 사실·진행 상황·"
+    "미해결 과제·어시스턴트가 약속한 것, 그리고 중요한 코드·파일 경로·이름·수치를 빠짐없이 담되 "
+    "장황하지 않게 정리한다. 이전 요약이 함께 주어지면 그것까지 통합해 하나의 최신 요약으로 만든다. "
+    "한국어 불릿으로 간결하게 요약만 출력하고, 그 밖의 말은 하지 않는다."
+)
+
+
+def _render_for_compaction(messages: list[dict]) -> str:
+    """압축 대상 메시지들을 요약기에 넣을 대화록 텍스트로 만든다.
+
+    user/assistant 발화만 담는다(system/tool은 요약에 방해). 전체가 상한을 넘으면
+    최근 쪽을 남긴다 — 가장 오래된 맥락은 (반복 압축이면) 이전 요약이 이미 담고 있다.
+    """
+    lines = []
+    for m in messages:
+        role = m.get("role")
+        if role not in ("user", "assistant"):
+            continue
+        content = str(m.get("content") or "").strip()
+        if not content:
+            continue
+        who = "사용자" if role == "user" else "어시스턴트"
+        lines.append(f"{who}: {content[:COMPACT_MSG_CHARS]}")
+    return "\n".join(lines)[-COMPACT_TRANSCRIPT_MAX:]
+
+
+async def summarize_conversation(
+    *, base_url: str, model: str, messages: list[dict], prior_summary: str = "",
+    api_key: str = "local", send_top_k: bool = True,
+) -> str | None:
+    """압축 대상 메시지들을 하나의 '이어가기용' 요약으로 만든다.
+
+    prior_summary가 있으면(이미 한 번 압축된 대화) 그것까지 통합한다. 비스트리밍 LLM
+    호출 1회. **실패하면 None을 반환한다** — 호출부가 원본 메시지를 파괴하지 않도록.
+    """
+    transcript = _render_for_compaction(messages)
+    if not transcript.strip():
+        return prior_summary or None  # 요약할 실제 발화가 없으면 기존 요약 유지
+    client = AsyncOpenAI(base_url=base_url, api_key=api_key or "none", timeout=180)
+    parts = []
+    if prior_summary.strip():
+        parts.append(f"[기존 요약]\n{prior_summary.strip()}")
+    parts.append(f"[압축할 대화]\n{transcript}")
+    parts.append("위 내용을 이어서 대화할 수 있도록 하나의 요약으로 정리하라.")
+    try:
+        resp = await client.chat.completions.create(
+            model=model,
+            messages=[
+                {"role": "system", "content": _COMPACT_SYSTEM},
+                {"role": "user", "content": "\n\n".join(parts)},
+            ],
+            stream=False,
+            temperature=0.3,
+            max_tokens=1200,
+            extra_body={"top_k": 20} if send_top_k else None,
+        )
+        summary = (resp.choices[0].message.content or "").strip()
+    except Exception:  # noqa: BLE001 — 실패는 None으로 알려 파괴를 막는다
+        return None
+    return summary or prior_summary or None
 
 
 async def _mock_stream(messages: list[dict]) -> AsyncIterator[dict]:

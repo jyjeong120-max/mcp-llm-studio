@@ -8,15 +8,53 @@ const sendBtn = $("sendBtn");
 const taskModeBtn = $("taskModeBtn");
 
 let currentConvId = null;
+let currentProjectId = null;   // 활성 프로젝트 (null = "기본" 공간). 대화·메모리·프롬프트 격리 기준.
 let attachments = [];   // {id, name, chars}
 let sending = false;
 let abortController = null;
-let taskMode = false;   // 작업 모드(계획-실행) 토글 상태
+
+/* 활성 프로젝트를 대화·메모리 API 요청에 실어보내는 쿼리 조각. 기본 공간이면 빈 문자열. */
+function projQuery(prefix = "?") {
+  return currentProjectId ? `${prefix}project_id=${encodeURIComponent(currentProjectId)}` : "";
+}
 let lastStatus = null;  // 마지막 /api/status 응답 (셋업 바·서빙 버튼 판단용)
 
+// 처리 모드 3단: auto(라우터가 자동 분류) → task(작업 강제) → chat(채팅 강제) → auto…
+// 클릭으로 순환한다. auto가 기본 — 요청을 보고 계획-실행/단일응답을 알아서 고른다.
+let chatMode = "auto";
+const MODE_UI = {
+  auto: { icon: "🧭", title: "라우팅: 자동 — 요청을 보고 작업/채팅을 자동 판단 (클릭: 작업 강제)" },
+  task: { icon: "🧭", title: "라우팅: 작업 강제 — 항상 계획을 세워 단계별 실행 (클릭: 채팅 강제)" },
+  chat: { icon: "💬", title: "라우팅: 채팅 강제 — 항상 단일 응답 (클릭: 자동으로)" },
+};
+function applyModeBtn() {
+  const u = MODE_UI[chatMode];
+  taskModeBtn.textContent = u.icon;
+  taskModeBtn.title = u.title;
+  taskModeBtn.classList.toggle("active", chatMode === "task");
+  taskModeBtn.classList.toggle("mode-chat", chatMode === "chat");
+}
 taskModeBtn.addEventListener("click", () => {
-  taskMode = !taskMode;
-  taskModeBtn.classList.toggle("active", taskMode);
+  chatMode = chatMode === "auto" ? "task" : chatMode === "task" ? "chat" : "auto";
+  applyModeBtn();
+});
+applyModeBtn();
+
+// 코드블록 복사 — 버튼은 md() 가 매 렌더마다 새로 그리므로(스트리밍) 개별 리스너
+// 대신 messagesEl 한 곳에 위임한다. 코드 원문은 형제 <code>의 textContent(escape 해제)로 읽는다.
+messagesEl.addEventListener("click", async (e) => {
+  const btn = e.target.closest(".copy-btn");
+  if (!btn) return;
+  const code = btn.parentElement.querySelector("code");
+  if (!code) return;
+  try {
+    await navigator.clipboard.writeText(code.textContent);
+    btn.textContent = "복사됨";
+    btn.classList.add("copied");
+  } catch {
+    btn.textContent = "복사 실패";
+  }
+  setTimeout(() => { btn.textContent = "복사"; btn.classList.remove("copied"); }, 1500);
 });
 
 /* 외부 LLM 프로바이더 — 선택값/키는 전부 서버(config.json)에 저장된다.
@@ -47,41 +85,115 @@ function escapeHtml(s) {
           .replace(/"/g, "&quot;");
 }
 
+// 목록 항목·문단·표 셀 등의 인라인 마크업. src는 이미 escapeHtml 된 상태로 들어온다.
 function mdInline(s) {
-  return s
-    .replace(/`([^`]+)`/g, (_, c) => `<code>${c}</code>`)
-    .replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>")
-    .replace(/(^|[^*])\*([^*\s][^*]*)\*/g, "$1<em>$2</em>")
-    .replace(/\[([^\]]+)\]\((https?:\/\/[^)\s]+)\)/g,
-      '<a href="$2" target="_blank" rel="noopener">$1</a>');
+  // 백틱 인라인 코드 구간과 그 외를 나눠, 코드 내부에는 굵게/이탤릭/취소선을
+  // 적용하지 않는다 (split 으로 격리 — 자리표시자가 없어 텍스트와 충돌하지 않는다).
+  return s.split(/(`[^`]+`)/).map((seg) => {
+    if (seg.length > 1 && seg[0] === "`" && seg[seg.length - 1] === "`")
+      return `<code>${seg.slice(1, -1)}</code>`;
+    return seg
+      // 이미지 ![alt](url) — 링크보다 먼저 처리해야 앞의 '!'가 남지 않는다.
+      // 폐쇄망에선 외부 이미지는 안 뜨고 alt가 대신 보인다(정상). data:image 도 허용.
+      .replace(/!\[([^\]]*)\]\((https?:\/\/[^)\s]+|data:image\/[^)\s]+)\)/g,
+        '<img src="$2" alt="$1" class="md-img">')
+      .replace(/\[([^\]]+)\]\((https?:\/\/[^)\s]+)\)/g,                 // 링크
+        '<a href="$2" target="_blank" rel="noopener">$1</a>')
+      .replace(/\*\*\*([^*]+)\*\*\*/g, "<strong><em>$1</em></strong>")  // 굵은 이탤릭
+      .replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>")               // 굵게
+      .replace(/(^|[^*])\*([^*\s][^*]*)\*/g, "$1<em>$2</em>")           // 이탤릭
+      .replace(/~~([^~]+)~~/g, "<del>$1</del>")                         // 취소선
+      // 맨 URL 자동 링크 — 위에서 만든 <a>/<img> 속성값(따옴표·괄호 뒤)은 건드리지
+      // 않도록 앞 문자를 제한한다.
+      .replace(/(^|[^"(>=/])(https?:\/\/[^\s<)]+)/g,
+        '$1<a href="$2" target="_blank" rel="noopener">$2</a>');
+  }).join("");
+}
+
+const LIST_RE = /^(\s*)([-*+]|\d+[.)])\s+(.*)$/;
+
+// 들여쓰기 깊이로 중첩 목록을 재귀 구성한다. items[idx]부터 base 이상 깊이의
+// 형제 항목을 한 <ul>/<ol>로 묶고, 더 깊은 항목은 직전 <li> 안으로 내려보낸다.
+function renderListItems(items, idx, base) {
+  const first = items[idx];
+  const tag = first.ordered ? "ol" : "ul";
+  const startAttr = first.ordered && first.start !== 1 ? ` start="${first.start}"` : "";
+  let html = `<${tag}${startAttr}>`;
+  while (idx < items.length && items[idx].indent >= base) {
+    if (items[idx].indent > base) { idx++; continue; }   // 방어적: 정상 흐름엔 안 옴
+    const it = items[idx];
+    let body = it.checked === null
+      ? mdInline(it.content)
+      : `<label class="task"><input type="checkbox" disabled${it.checked ? " checked" : ""}> ${mdInline(it.content)}</label>`;
+    idx++;
+    if (idx < items.length && items[idx].indent > it.indent) {   // 하위 목록
+      const sub = renderListItems(items, idx, items[idx].indent);
+      body += sub.html;
+      idx = sub.idx;
+    }
+    html += `<li${it.checked === null ? "" : ' class="task-item"'}>${body}</li>`;
+  }
+  return { html: html + `</${tag}>`, idx };
 }
 
 function md(src) {
+  // ── 수식 보호 ──────────────────────────────────────────────
+  // $..$ / $$..$$ / \(..\) / \[..\] 안의 *, _, \ 를 마크다운 인라인 처리가
+  // 건드리지 않도록 먼저 placeholder(@@MATHn@@)로 빼둔다. KaTeX 렌더는
+  // 여기서 하지 않고(스트리밍 매 토큰 호출 회피) 완성된 메시지에서 enhanceContent()가
+  // 한 번에 한다. 코드펜스/인라인코드 안의 $ (셸 변수 등)는 수식으로 보지 않는다.
+  const math = [];
+  const stash = (tex, display) => `@@MATH${math.push({ tex, display }) - 1}@@`;
+  const protectMath = (t) => t
+    .replace(/\$\$([\s\S]+?)\$\$/g, (_, x) => stash(x, true))                 // 블록 $$..$$
+    .replace(/\\\[([\s\S]+?)\\\]/g, (_, x) => stash(x, true))                 // 블록 \[..\]
+    .replace(/(^|[^\\$])\$(?!\s)([^\n$]+?)(?<!\s)\$/g, (_, p, x) => p + stash(x, false))  // 인라인 $..$
+    .replace(/\\\(([\s\S]+?)\\\)/g, (_, x) => stash(x, false));              // 인라인 \(..\)
+  // 코드(펜스·인라인)를 홀수 인덱스로 분리해 그 안에서는 수식 추출을 건너뛴다.
+  src = src.split(/(```[\s\S]*?```|~~~[\s\S]*?~~~|`[^`\n]*`)/g)
+           .map((seg, idx) => (idx % 2 ? seg : protectMath(seg))).join("");
+
   const lines = escapeHtml(src).split("\n");
   const out = [];
   let i = 0;
   while (i < lines.length) {
     const line = lines[i];
-    if (line.startsWith("```")) {                       // 코드 블록
+    if (line.startsWith("```") || line.startsWith("~~~")) {  // 코드 블록
+      const fence = line.slice(0, 3);
+      const lang = line.slice(3).trim().replace(/[^\w+.#-]/g, "");
       const buf = [];
       i++;
-      while (i < lines.length && !lines[i].startsWith("```")) buf.push(lines[i++]);
-      i++;
-      out.push(`<pre><code>${buf.join("\n")}</code></pre>`);
-    } else if (/^#{1,3}\s/.test(line)) {                // 제목
+      while (i < lines.length && !lines[i].startsWith(fence)) buf.push(lines[i++]);
+      i++;                                                // 닫는 펜스 소비
+      const attr = lang ? ` data-lang="${lang}" class="lang-${lang}"` : "";
+      // language-<lang> 은 highlight.js 가 문법을 고르는 클래스. 없으면 자동 감지.
+      const codeClass = lang ? ` class="language-${lang}"` : "";
+      // 복사 버튼은 절대 위치라 흐름 밖(코드 텍스트에 안 섞임). 클릭은 messagesEl 위임.
+      out.push(`<pre${attr}><button class="copy-btn" type="button" aria-label="코드 복사">복사</button><code${codeClass}>${buf.join("\n")}</code></pre>`);
+      continue;
+    } else if (/^#{1,6}\s/.test(line)) {                // 제목 (h1~h6)
       const level = line.match(/^#+/)[0].length;
       out.push(`<h${level}>${mdInline(line.replace(/^#+\s*/, ""))}</h${level}>`);
-    } else if (/^(\*{3,}|-{3,})\s*$/.test(line)) {      // 구분선
+      i++;  continue;
+    } else if (/^\s*(\*{3,}|-{3,}|_{3,})\s*$/.test(line)) {  // 구분선
       out.push("<hr>"); i++;  continue;
-    } else if (/^\s*([-*]|\d+\.)\s/.test(line)) {       // 목록
-      const ordered = /^\s*\d+\./.test(line);
-      const tag = ordered ? "ol" : "ul";
+    } else if (LIST_RE.test(line)) {                    // 목록 (중첩·체크박스 지원)
       const items = [];
-      while (i < lines.length && /^\s*([-*]|\d+\.)\s/.test(lines[i])) {
-        items.push(`<li>${mdInline(lines[i].replace(/^\s*([-*]|\d+\.)\s/, ""))}</li>`);
+      while (i < lines.length && LIST_RE.test(lines[i])) {
+        const m = lines[i].match(LIST_RE);
+        const ordered = /\d/.test(m[2]);
+        let content = m[3], checked = null;
+        const tm = content.match(/^\[([ xX])\]\s+(.*)$/);   // - [ ] / - [x]
+        if (tm) { checked = /[xX]/.test(tm[1]); content = tm[2]; }
+        items.push({
+          indent: m[1].replace(/\t/g, "    ").length,
+          ordered,
+          start: ordered ? parseInt(m[2], 10) : 1,
+          content, checked,
+        });
         i++;
       }
-      out.push(`<${tag}>${items.join("")}</${tag}>`);
+      out.push(renderListItems(items, 0, items[0].indent).html);
       continue;
     } else if (line.startsWith("&gt;")) {               // 인용
       const buf = [];
@@ -95,11 +207,17 @@ function md(src) {
                && /^\s*\|?[\s:|-]+\|[\s:|-]*$/.test(lines[i + 1])) {  // 표
       const cells = (row) => row.split("|").map(c => c.trim()).filter((c, idx, a) =>
         !(c === "" && (idx === 0 || idx === a.length - 1)));
-      const head = cells(line).map(c => `<th>${mdInline(c)}</th>`).join("");
+      // 구분줄(:---:)에서 열 정렬을 읽어 셀에 style 로 적용한다.
+      const aligns = cells(lines[i + 1]).map((sep) => {
+        const l = sep.startsWith(":"), r = sep.endsWith(":");
+        return l && r ? "center" : r ? "right" : l ? "left" : "";
+      });
+      const al = (idx) => aligns[idx] ? ` style="text-align:${aligns[idx]}"` : "";
+      const head = cells(line).map((c, idx) => `<th${al(idx)}>${mdInline(c)}</th>`).join("");
       i += 2;
       const rows = [];
       while (i < lines.length && lines[i].includes("|")) {
-        rows.push(`<tr>${cells(lines[i]).map(c => `<td>${mdInline(c)}</td>`).join("")}</tr>`);
+        rows.push(`<tr>${cells(lines[i]).map((c, idx) => `<td${al(idx)}>${mdInline(c)}</td>`).join("")}</tr>`);
         i++;
       }
       out.push(`<table><thead><tr>${head}</tr></thead><tbody>${rows.join("")}</tbody></table>`);
@@ -109,15 +227,46 @@ function md(src) {
     } else {                                            // 문단
       const buf = [line];
       i++;
-      while (i < lines.length && lines[i].trim() !== "" && !/^(#|```|[-*]\s|\d+\.\s|&gt;)/.test(lines[i])) {
+      while (i < lines.length && lines[i].trim() !== ""
+             && !/^(#{1,6}\s|```|~~~|\s*([-*+]|\d+[.)])\s|&gt;)/.test(lines[i])) {
         buf.push(lines[i]); i++;
       }
       out.push(`<p>${buf.map(mdInline).join("<br>")}</p>`);
       continue;
     }
-    i++;
   }
-  return out.join("\n");
+  let html = out.join("\n");
+  // 빼뒀던 수식을 KaTeX 가 읽을 span 으로 복원한다. tex 는 escapeHtml 로 넣어
+  // 두고, enhanceContent()가 el.textContent(escape 해제된 원문)로 렌더한다.
+  if (math.length)
+    html = html.replace(/@@MATH(\d+)@@/g, (_, n) => {
+      const m = math[+n];
+      return `<span class="katex-src" data-display="${m.display ? 1 : 0}">${escapeHtml(m.tex)}</span>`;
+    });
+  return html;
+}
+
+/* 완성된(스트리밍 종료·이력 로드) 메시지에만 코드 하이라이트·수식 렌더를 한 번 적용한다.
+   스트리밍 중 매 토큰 재렌더에는 돌리지 않는다(비용·깜빡임). vendor 라이브러리가
+   로드 안 됐으면 조용히 건너뛴다(우아한 저하 — 코드/수식은 원문 그대로 보인다). */
+function enhanceContent(root) {
+  if (window.hljs) {
+    root.querySelectorAll("pre code:not([data-highlighted])").forEach((el) => {
+      try { window.hljs.highlightElement(el); } catch { /* 하이라이트 실패는 무시 */ }
+    });
+  }
+  if (window.katex) {
+    root.querySelectorAll(".katex-src:not([data-rendered])").forEach((el) => {
+      const tex = el.textContent;
+      el.dataset.rendered = "1";   // 재실행 시 렌더된 내용을 tex 로 오인하지 않게
+      try {
+        window.katex.render(tex, el, {
+          displayMode: el.dataset.display === "1",
+          throwOnError: false,
+        });
+      } catch { /* 잘못된 수식은 원문 유지 */ }
+    });
+  }
 }
 
 /* ==================== 메시지 렌더링 ==================== */
@@ -309,16 +458,6 @@ function addErrorNote(container, message) {
 }
 
 /* 계획-실행(작업 모드) 렌더 */
-function addPlanBlock(container, steps, replan) {
-  const div = document.createElement("div");
-  div.className = "plan-block";
-  const title = replan ? `🧭 재계획 #${replan}` : "🧭 계획";
-  div.innerHTML = `<div class="plan-title">${title}</div><ol>` +
-    steps.map(s => `<li>${escapeHtml(s)}</li>`).join("") + "</ol>";
-  container.appendChild(div);
-  scrollBottom();
-}
-
 function addPlanNote(container, text) {
   const div = document.createElement("div");
   div.className = "plan-note";
@@ -358,6 +497,305 @@ function finishStepBlock(details, ok, result) {
   details.open = false;   // 끝난 단계는 접어 답변에 집중
 }
 
+/* 의도 판단(라우터) 노드 — 코크핏의 0번 노드. 이번 요청을 작업/채팅 중 무엇으로
+   처리하는지와 그 이유를 보여준다. 오분류를 사람이 알아채고 🧭로 강제 전환하게 한다. */
+function addRouteNode(container, useTask, reason) {
+  const div = document.createElement("div");
+  div.className = "route-node " + (useTask ? "task" : "chat");
+  div.innerHTML = `🧭 <b>의도 판단</b> — ${useTask ? "작업(계획-실행)" : "채팅(단일 응답)"}` +
+    (reason ? ` <span class="route-reason">${escapeHtml(reason)}</span>` : "");
+  container.appendChild(div);
+  scrollBottom();
+}
+
+/* 조건 분기 노드 (Layer 3) — 조건을 규칙/LLM으로 판정해 이후 단계를 건너뛴다.
+   branch_start에서 '판정 중' 노드를 붙이고, branch가 오면 참/거짓과 건너뛴 단계를 채운다. */
+function addBranchNode(container, index, cond, mode) {
+  const div = document.createElement("div");
+  div.className = "branch-node pending";
+  div.innerHTML = `🔀 <b>분기 ${index + 1}</b> ${escapeHtml(cond || "")} ` +
+    `<span class="branch-mode">${mode === "rule" ? "규칙" : "LLM"} 판정 중…</span>`;
+  container.appendChild(div);
+  scrollBottom();
+  return div;
+}
+
+function finishBranchNode(div, ev) {
+  if (!div) return;
+  div.classList.remove("pending");
+  div.classList.add(ev.result ? "yes" : "no");
+  const skipped = (ev.skipped || []);
+  const label = ev.result
+    ? "참 → 계속"
+    : (skipped.length ? `거짓 → 단계 ${skipped.join(", ")} 건너뜀` : "거짓 → 건너뛸 단계 없음");
+  const modeTxt = ev.mode === "rule" ? "규칙" : "LLM";
+  const note = ev.note ? ` <span class="branch-mode">(${escapeHtml(ev.note)})</span>` : "";
+  div.innerHTML = `🔀 <b>분기</b> ${escapeHtml(ev.cond || "")} ` +
+    `<span class="branch-result">${label}</span> ` +
+    `<span class="branch-mode">(${modeTxt} 판정)</span>${note}`;
+  scrollBottom();
+}
+
+function expireBranchNode(div) {
+  if (!div || !div.classList.contains("pending")) return;
+  div.classList.remove("pending");
+  div.querySelector(".branch-mode").textContent = "판정 중단됨";
+}
+
+/* ==================== 실행 코크핏 (Layer 4) ====================
+   작업 모드의 계획·단계·분기를 흩어진 카드가 아니라 하나의 세로 플로차트로 묶어
+   보여준다. 각 노드는 살아있는 상태(대기/실행중/완료/실패/거절/건너뜀)를 색으로
+   반영하고, 의존 태그([←N])는 배지와 hover 강조로 데이터 흐름을 드러낸다.
+   무거운 그래프 라이브러리 없이 순수 CSS/JS로 그린다(선형+분기만 다루므로 충분). */
+
+const NODE_STATUS_LABEL = {
+  pending: "대기", running: "실행중", done: "완료", fail: "실패",
+  denied: "거절", skip: "건너뜀", yes: "참", no: "거짓", deciding: "판정중",
+};
+
+// _step_display가 붙인 앞머리 [태그]들을 본문에서 떼어낸다(구조는 배지로 따로 보여준다).
+function stripStepTags(text) {
+  return (text || "").replace(/^(?:\s*\[[^\]]*\]\s*)+/, "").trim() || (text || "");
+}
+
+function setNodeStatus(node, status, label) {
+  if (!node) return;
+  const pill = node.querySelector(".pill");
+  if (pill) {
+    pill.dataset.status = status;
+    pill.textContent = label || NODE_STATUS_LABEL[status] || status;
+  }
+  node.dataset.status = status;
+}
+
+function cockpitNodeLog(node, { open = false } = {}) {
+  if (!node) return null;
+  const log = node.querySelector(".node-log");
+  if (log && open) log.classList.remove("hidden");
+  return log;
+}
+
+// hover 시 이 노드가 참조하는(←) / 이 노드를 참조하는(→) 단계를 함께 강조한다.
+function highlightLinks(flow, node, on) {
+  const rel = [];
+  (node.dataset.deps || "").split(",").filter(Boolean).forEach(n => rel.push(+n - 1));
+  (node.dataset.consumers || "").split(",").filter(Boolean).forEach(n => rel.push(+n - 1));
+  rel.forEach(i => {
+    const t = flow.querySelector(`.node[data-index="${i}"]`);
+    if (t) t.classList.toggle("linked", on);
+  });
+  node.classList.toggle("linked-src", on);
+}
+
+/* 계획(및 재계획/편집)에 맞춰 코크핏 플로차트를 세운다. prevStatus를 주면 이미
+   끝난 앞 단계의 상태를 복원한다(재계획은 tail만 바뀌므로 앞 단계는 그대로 유지). */
+function buildCockpit(container, steps, meta, prevStatus) {
+  const old = container.querySelector(".cockpit");
+  if (old) old.remove();
+  const panel = document.createElement("div");
+  panel.className = "cockpit";
+  const title = document.createElement("div");
+  title.className = "cockpit-title";
+  title.innerHTML = "🧭 <b>실행 코크핏</b> <span class=\"hint\">계획 흐름 · 노드 클릭 시 결과</span>";
+  const flow = document.createElement("div");
+  flow.className = "flow";
+  const nodes = [];
+  steps.forEach((text, i) => {
+    const m = (meta && meta[i]) || {};
+    const isBranch = !!m.branch;
+    const node = document.createElement("div");
+    node.className = "node" + (isBranch ? " is-branch" : "");
+    node.dataset.index = i;
+    if (m.deps) node.dataset.deps = m.deps.join(",");
+    if (m.consumers) node.dataset.consumers = m.consumers.join(",");
+    const badges = [];
+    if (m.deps) badges.push(`<span class="dep in" title="이 단계가 참조하는 단계">← ${m.deps.join(",")}</span>`);
+    if (m.consumers) badges.push(`<span class="dep out" title="이 단계 결과를 쓰는 단계">→ ${m.consumers.join(",")}</span>`);
+    if (m.scope && m.scope.length) badges.push(`<span class="scope">${escapeHtml(m.scope.join(", "))}</span>`);
+    if (isBranch) {
+      const mode = m.branch.mode === "rule" ? "규칙" : "LLM";
+      badges.push(`<span class="scope">?→${m.branch.target} · ${mode}</span>`);
+    }
+    const num = isBranch ? "🔀" : String(i + 1);
+    node.innerHTML =
+      `<div class="node-head">` +
+        `<span class="pill" data-status="pending">대기</span>` +
+        `<span class="node-num">${num}</span>` +
+        `<span class="node-body">${escapeHtml(stripStepTags(text))}</span>` +
+        `<span class="node-badges">${badges.join("")}</span>` +
+      `</div>` +
+      `<pre class="node-log hidden"></pre>`;
+    node.querySelector(".node-head").onclick = () => {
+      const log = node.querySelector(".node-log");
+      if (log && log.textContent.trim()) log.classList.toggle("hidden");
+    };
+    node.addEventListener("mouseenter", () => highlightLinks(flow, node, true));
+    node.addEventListener("mouseleave", () => highlightLinks(flow, node, false));
+    flow.append(node);
+    nodes.push(node);
+  });
+  panel.append(title, flow);
+  container.appendChild(panel);
+  // 이미 끝난 앞 단계의 상태를 복원한다. 단, 재계획은 실패 지점부터 tail을 갈아끼우므로
+  // '본문이 그대로인 노드'만 복원한다 — 자리(index)가 같아도 내용이 바뀐 새 단계에
+  // 옛 완료/실패 상태가 잘못 묻어나지 않게 한다.
+  const TRANSIENT = new Set(["pending", "running", "deciding"]);
+  if (prevStatus) {
+    prevStatus.forEach((s, i) => {
+      if (s && nodes[i] && !TRANSIENT.has(s.status) && s.body === stripStepTags(steps[i])) {
+        setNodeStatus(nodes[i], s.status, s.label);
+        // 완료 단계의 결과 로그도 되살린다(접힌 채) — 재계획 후 클릭 시 결과가 비지 않게.
+        if (s.log) {
+          const log = nodes[i].querySelector(".node-log");
+          if (log) log.textContent = s.log;
+        }
+      }
+    });
+  }
+  scrollBottom();
+  return nodes;
+}
+
+// 재계획/편집 전, 현재 노드 상태+본문을 갈무리해 복원 판단에 쓴다.
+function snapshotCockpit(nodes) {
+  if (!nodes) return null;
+  return nodes.map(n => {
+    const pill = n.querySelector(".pill");
+    const body = n.querySelector(".node-body");
+    const log = n.querySelector(".node-log");
+    return pill ? { status: pill.dataset.status, label: pill.textContent,
+                    body: body ? body.textContent : "",
+                    log: log ? log.textContent : "" } : null;
+  });
+}
+
+/* 조종 게이트 카드 (계획 확정 / 스텝 실패) — 승인 카드와 같은 방식으로 서버가 멈추고
+   steer_request를 보내면, 결정을 POST /api/chat/steer 로 답한다. 서버는 그 결정에 따라
+   흐름을 이어간다(plan/step_start 이벤트가 뒤따른다). onResolved는 대기 상태 해제용. */
+const STEER_LABELS = {
+  run: "✅ 계획대로 실행합니다", edit: "✏ 편집한 계획으로 진행합니다",
+  abort: "🚫 작업을 중단했습니다", retry: "↻ 이 단계를 재시도합니다",
+  skip: "⏭ 이 단계를 건너뜁니다", replan: "🧭 계획을 다시 세웁니다",
+};
+
+function mkBtn(label, cls, onclick) {
+  const b = document.createElement("button");
+  b.className = "btn" + (cls ? " " + cls : "");
+  b.textContent = label;
+  b.onclick = onclick;
+  return b;
+}
+
+function addSteerBlock(container, ev, onResolved) {
+  const div = document.createElement("div");
+  div.className = "steer";
+  const decide = async (payload) => {
+    div.querySelectorAll("button, textarea, input").forEach(b => b.disabled = true);
+    try {
+      const res = await fetch("/api/chat/steer", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ id: ev.id, ...payload }),
+      });
+      if (res.status === 404) { expireSteerBlock(div); return; }
+      if (res.status === 403) {
+        expireSteerBlock(div, "⚠ 조종은 서버 PC(127.0.0.1)에서만 할 수 있습니다");
+        return;
+      }
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      finishSteerBlock(div, payload.action);
+      if (onResolved) onResolved();
+    } catch {
+      // 일시 오류 — 다시 시도할 수 있게 컨트롤을 되살린다
+      div.querySelectorAll("button, textarea, input").forEach(b => b.disabled = false);
+    }
+  };
+  if (ev.phase === "plan") buildPlanGate(div, ev, decide);
+  else buildFailGate(div, ev, decide);
+  container.appendChild(div);
+  scrollBottom();
+  return div;
+}
+
+// 계획 확정 게이트: 계획을 편집 가능한 텍스트로 보여주고 [실행](편집 시 자동 반영)·[취소].
+function buildPlanGate(div, ev, decide) {
+  const head = document.createElement("div");
+  head.className = "steer-head";
+  head.innerHTML = "🧭 <b>계획 확인</b> — 실행 전에 계획을 확인하거나 편집하세요 " +
+    '<span class="hint">(한 줄에 한 단계, [서버]·[←번호] 태그 유지)</span>';
+  const ta = document.createElement("textarea");
+  ta.className = "steer-plan";
+  ta.spellcheck = false;
+  const steps = ev.steps || [];
+  const original = steps.map((s, i) => `${i + 1}. ${s}`).join("\n");
+  ta.value = original;
+  ta.rows = Math.max(3, steps.length + 1);
+  const row = document.createElement("div");
+  row.className = "steer-btns";
+  const run = mkBtn("실행", "primary", () => {
+    const lines = ta.value.split("\n")
+      .map(l => l.replace(/^\s*\d+[.)]\s*/, "").trim())  // 앞머리 번호 제거
+      .filter(Boolean);
+    const edited = ta.value.trim() !== original.trim();
+    decide(edited ? { action: "edit", steps: lines } : { action: "run" });
+  });
+  row.append(run, mkBtn("취소", "danger", () => decide({ action: "abort" })));
+  div.append(head, ta, row);
+}
+
+// 스텝 실패 게이트: 실패한 단계와 결과를 보여주고 재시도/건너뛰기/재계획/편집/중단.
+function buildFailGate(div, ev, decide) {
+  const head = document.createElement("div");
+  head.className = "steer-head";
+  head.innerHTML = `⚠ <b>단계 ${(ev.index ?? 0) + 1} 실패</b> — 어떻게 할까요?`;
+  const info = document.createElement("pre");
+  info.className = "steer-info";
+  info.textContent = `단계: ${ev.step || ""}\n결과: ${ev.result || ""}`;
+  const editRow = document.createElement("div");
+  editRow.className = "steer-edit hidden";
+  const inp = document.createElement("input");
+  inp.type = "text";
+  inp.value = ev.step || "";
+  editRow.append(inp, mkBtn("편집 후 재시도", "primary",
+    () => decide({ action: "edit", step: inp.value })));
+  const row = document.createElement("div");
+  row.className = "steer-btns";
+  row.append(
+    mkBtn("재시도", "primary", () => decide({ action: "retry" })),
+    mkBtn("건너뛰기", "", () => decide({ action: "skip" })),
+    mkBtn("재계획", "", () => decide({ action: "replan" })),
+    mkBtn("편집", "", () => editRow.classList.toggle("hidden")),
+    mkBtn("중단", "danger", () => decide({ action: "abort" })),
+  );
+  div.append(head, info, row, editRow);
+}
+
+function finishSteerBlock(div, action) {
+  div.querySelectorAll(".steer-btns, .steer-edit").forEach(e => e.remove());
+  const ta = div.querySelector(".steer-plan");
+  if (ta) ta.disabled = true;
+  const note = document.createElement("div");
+  note.className = "steer-note";
+  note.textContent = STEER_LABELS[action] || `결정: ${action}`;
+  div.appendChild(note);
+  div.classList.add("resolved");
+  scrollBottom();
+}
+
+/* 결정이 불가능해진 조종 카드를 종결한다 — 404(이미 처리/만료)·403(원격)·스트림 중단. */
+function expireSteerBlock(div, text) {
+  if (!div) return;
+  div.querySelectorAll(".steer-btns, .steer-edit").forEach(e => e.remove());
+  const ta = div.querySelector(".steer-plan");
+  if (ta) ta.disabled = true;
+  if (div.querySelector(".steer-note")) return;
+  const note = document.createElement("div");
+  note.className = "steer-note";
+  note.textContent = text || "⚠ 만료된 요청 — 이미 처리됐거나 시간이 초과되었습니다";
+  div.appendChild(note);
+  div.classList.add("resolved");
+}
+
 function scrollBottom() {
   messagesEl.scrollTop = messagesEl.scrollHeight;
 }
@@ -392,6 +830,7 @@ function renderHistory(messages) {
       if (block) finishToolBlock(block, m.content, !isDeniedToolResult(m.content));
     }
   }
+  enhanceContent(messagesEl);   // 불러온 이력 전체에 코드 하이라이트·수식 렌더
   scrollBottom();
 }
 
@@ -408,9 +847,10 @@ async function send() {
   const body = {
     message: text,
     conversation_id: currentConvId,
+    project_id: currentProjectId,
     attachments: attachments.map(a => a.id),
     provider: $("providerSelect").value || null,
-    task_mode: taskMode,
+    mode: chatMode,
   };
   inputEl.value = "";
   autoResize();
@@ -425,7 +865,11 @@ async function send() {
   let buffer = "";
   let currentTool = null;
   let currentApproval = null;  // 대기 중인 위험 도구 승인 카드
-  let currentStep = null;   // 현재 진행 중인 단계 블록 (작업 모드)
+  let currentSteer = null;  // 대기 중인 조종 게이트 카드 (계획/실패)
+  let currentStep = null;   // 현재 진행 중인 단계 블록 (작업 모드·코크핏 없을 때 폴백)
+  let currentBranch = null; // 판정 중인 조건 분기 노드 (작업 모드·폴백)
+  let cockpitNodes = null;  // 실행 코크핏 플로차트의 노드 엘리먼트 배열 (Layer 4)
+  let nodeDenied = false;   // 현재 단계에서 위험 도구 승인이 거절됐는지 (거절≠실패 구분)
   let reasoningEl = null;   // 모델 생각(추론) 블록 (추론형 모델일 때만)
   // 계획/단계 블록이 붙은 뒤에는 다음 답변 토큰을 맨 아래 새 영역에서 시작한다.
   let answerFresh = false;
@@ -477,18 +921,68 @@ async function send() {
           buffer += ev.text;
           contentEl.innerHTML = md(buffer);
           scrollBottom();
+        } else if (ev.type === "route") {
+          addRouteNode(container, ev.use_task, ev.reason);
+          answerFresh = true;
+        } else if (ev.type === "steer_request") {
+          if (!buffer) contentEl.remove();
+          currentSteer = addSteerBlock(container, ev, () => status.waiting(false));
+          status.waiting(true);
+          answerFresh = true;
         } else if (ev.type === "plan") {
-          addPlanBlock(container, ev.steps || [], ev.replan);
+          // 코크핏 재구성(재계획/편집이면 앞 단계 상태 복원). 계획 요약 카드도 함께 남긴다.
+          cockpitNodes = buildCockpit(container, ev.steps || [], ev.meta,
+            snapshotCockpit(cockpitNodes));
+          if (ev.replan || ev.edited) {
+            addPlanNote(container, ev.edited ? "🧭 계획을 편집했습니다"
+              : `🧭 계획을 다시 세웠습니다 (#${ev.replan})`);
+          }
           answerFresh = true;
         } else if (ev.type === "step_start") {
-          currentStep = addStepBlock(container, ev.index, ev.text);
+          const node = cockpitNodes && cockpitNodes[ev.index];
+          if (node) {
+            nodeDenied = false;
+            setNodeStatus(node, "running");
+            node.scrollIntoView({ block: "nearest" });
+            cockpitNodeLog(node, { open: true }).textContent = "";
+          } else {
+            currentStep = addStepBlock(container, ev.index, ev.text);  // 폴백
+          }
           answerFresh = true;
         } else if (ev.type === "step_token") {
-          if (ev.index === -1) addPlanNote(container, ev.text);
-          else appendStepToken(currentStep, ev.text);
+          if (ev.index === -1) { addPlanNote(container, ev.text); }
+          else if (cockpitNodes && cockpitNodes[ev.index]) {
+            const log = cockpitNodeLog(cockpitNodes[ev.index], { open: true });
+            log.textContent += ev.text;
+            scrollBottom();
+          } else { appendStepToken(currentStep, ev.text); }
         } else if (ev.type === "step_done") {
-          finishStepBlock(currentStep, ev.ok, ev.result);
-          currentStep = null;
+          const node = cockpitNodes && cockpitNodes[ev.index];
+          if (node) {
+            setNodeStatus(node, ev.ok ? "done" : (nodeDenied ? "denied" : "fail"));
+            const log = cockpitNodeLog(node);
+            if (log && ev.result && !log.textContent.trim()) log.textContent = ev.result;
+            if (log) log.classList.add("hidden");  // 끝난 단계는 접어 흐름에 집중
+            nodeDenied = false;
+          } else { finishStepBlock(currentStep, ev.ok, ev.result); currentStep = null; }
+          answerFresh = true;
+        } else if (ev.type === "branch_start") {
+          const node = cockpitNodes && cockpitNodes[ev.index];
+          if (node) setNodeStatus(node, "deciding");
+          else currentBranch = addBranchNode(container, ev.index, ev.cond, ev.mode);
+          answerFresh = true;
+        } else if (ev.type === "branch") {
+          const node = cockpitNodes && cockpitNodes[ev.index];
+          if (node) {
+            setNodeStatus(node, ev.result ? "yes" : "no");
+            const modeTxt = ev.mode === "rule" ? "규칙" : "LLM";
+            const skipTxt = (ev.skipped && ev.skipped.length)
+              ? ` → 단계 ${ev.skipped.join(", ")} 건너뜀` : "";
+            const log = cockpitNodeLog(node);
+            if (log) log.textContent = `${modeTxt} 판정: ${ev.result ? "참" : "거짓"}${skipTxt}`
+              + (ev.note ? `\n(${ev.note})` : "");
+            (ev.skipped || []).forEach(n => setNodeStatus(cockpitNodes[n - 1], "skip"));
+          } else { finishBranchNode(currentBranch, ev); currentBranch = null; }
           answerFresh = true;
         } else if (ev.type === "approval_request") {
           if (!buffer) contentEl.remove();
@@ -498,6 +992,8 @@ async function send() {
           finishApprovalBlock(currentApproval, ev.approved, ev.timeout);
           currentApproval = null;
           status.waiting(false);
+          // 거절이면 현재 단계는 '실패'가 아니라 '거절'로 표시한다(코크핏 노드 상태).
+          if (!ev.approved) nodeDenied = true;
           // 승인 카드 다음 응답을 위해 새 content 영역을 연다
           buffer = "";
           contentEl = document.createElement("div");
@@ -529,7 +1025,21 @@ async function send() {
       expireApprovalBlock(currentApproval, "⚠ 중단됨 — 이 요청은 더 이상 승인할 수 없습니다");
       currentApproval = null;
     }
+    if (currentSteer) {
+      expireSteerBlock(currentSteer, "⚠ 중단됨 — 이 요청은 더 이상 조종할 수 없습니다");
+      currentSteer = null;
+    }
+    if (currentBranch) { expireBranchNode(currentBranch); currentBranch = null; }
+    // 코크핏에 실행중/판정중 상태로 멈춘 노드가 있으면 '중단됨'으로 마감한다.
+    if (cockpitNodes) {
+      cockpitNodes.forEach(n => {
+        const s = n.dataset.status;
+        if (s === "running" || s === "deciding") setNodeStatus(n, "fail", "중단됨");
+        else if (s === "pending") setNodeStatus(n, "skip", "미실행");  // 중단·예산소진으로 못 돈 단계
+      });
+    }
     if (reasoningEl) finishReasoning(reasoningEl);
+    enhanceContent(container);   // 완성된 답변에 코드 하이라이트·수식 렌더 (한 번)
     setSending(false);
     loadConversations();
   }
@@ -606,53 +1116,88 @@ inputEl.addEventListener("input", autoResize);
 
 /* ==================== 대화 목록 ==================== */
 
-async function loadConversations() {
-  const list = await (await fetch("/api/conversations")).json();
-  const ul = $("convList");
-  ul.innerHTML = "";
-  for (const meta of list) {
-    const li = document.createElement("li");
-    if (meta.id === currentConvId) li.classList.add("active");
-    const title = document.createElement("span");
-    title.className = "title";
-    title.textContent = meta.title;
-    const del = document.createElement("button");
-    del.className = "del";
-    del.textContent = "✕";
-    del.title = "삭제";
-    del.addEventListener("click", async (e) => {
-      e.stopPropagation();
-      if (!confirm(`"${meta.title}" 대화를 삭제할까요?`)) return;
-      await fetch(`/api/conversations/${meta.id}`, { method: "DELETE" });
-      if (meta.id === currentConvId) newChat();
-      loadConversations();
+/* 대화 목록 항목 <li>를 만든다. pid는 이 대화가 속한 공간(null=기본 공간).
+   삭제·이름변경·열기가 전부 자기 공간(pid)을 대상으로 하도록 pid를 실어 부른다.
+   기본 공간 리스트(#convList)와 프로젝트 폴더의 중첩 리스트가 함께 재사용한다. */
+function makeConvLi(meta, pid) {
+  const li = document.createElement("li");
+  // 활성 하이라이트는 "같은 공간의 같은 대화"일 때만 — 다른 공간의 동명 대화가 켜지지 않게.
+  if (meta.id === currentConvId && (pid || null) === currentProjectId) li.classList.add("active");
+  const q = pid ? `?project_id=${encodeURIComponent(pid)}` : "";
+  const title = document.createElement("span");
+  title.className = "title";
+  title.textContent = meta.title;
+  const del = document.createElement("button");
+  del.className = "del";
+  del.textContent = "✕";
+  del.title = "삭제";
+  del.addEventListener("click", async (e) => {
+    e.stopPropagation();
+    if (!confirm(`"${meta.title}" 대화를 삭제할까요?`)) return;
+    await fetch(`/api/conversations/${meta.id}${q}`, { method: "DELETE" });
+    if (meta.id === currentConvId && (pid || null) === currentProjectId) newChat();
+    loadConversations();
+  });
+  li.append(title, del);
+  li.addEventListener("click", () => openConversation(meta.id, pid || null));
+  li.addEventListener("dblclick", async () => {
+    const name = prompt("새 제목:", meta.title);
+    if (!name) return;
+    await fetch(`/api/conversations/${meta.id}/rename${q}`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ title: name }),
     });
-    li.append(title, del);
-    li.addEventListener("click", () => openConversation(meta.id));
-    li.addEventListener("dblclick", async () => {
-      const name = prompt("새 제목:", meta.title);
-      if (!name) return;
-      await fetch(`/api/conversations/${meta.id}/rename`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ title: name }),
-      });
-      loadConversations();
-      if (meta.id === currentConvId) $("convTitle").textContent = name;
-    });
-    ul.appendChild(li);
-  }
+    loadConversations();
+    if (meta.id === currentConvId && (pid || null) === currentProjectId) $("convTitle").textContent = name;
+  });
+  return li;
 }
 
-async function openConversation(id) {
+/* 사이드바 갱신. 프로젝트 폴더(loadProjects)를 먼저 그리고, 기본 공간 대화는
+   항상 #convList에 그린다(프로젝트 대화는 각 폴더 안에서 따로 채운다). */
+async function loadConversations() {
+  await loadProjects();
+  let list = [];
+  try { list = await (await fetch("/api/conversations")).json(); } catch (e) { list = []; }
+  const ul = $("convList");
+  ul.innerHTML = "";
+  if (!list.length) {
+    const li = document.createElement("li");
+    li.className = "tree-empty";
+    li.textContent = "대화 없음";
+    ul.appendChild(li);
+    return;
+  }
+  for (const meta of list) ul.appendChild(makeConvLi(meta, null));
+}
+
+async function openConversation(id, pid = null) {
   if (sending) return;
-  const res = await fetch(`/api/conversations/${id}`);
+  currentProjectId = pid || null;   // 대화를 열면 그 대화의 공간이 활성 공간이 된다
+  const res = await fetch(`/api/conversations/${id}${projQuery()}`);
   if (!res.ok) return;
   const conv = await res.json();
   currentConvId = conv.id;
   $("convTitle").textContent = conv.title;
   renderHistory(conv.messages);
+  if (conv.summary) prependSummaryBanner(conv.summary);
   loadConversations();
+}
+
+/* 압축된 대화 상단에, 사라진 앞부분을 대신하는 요약을 접이식 배너로 보여준다.
+   (요약은 conv.summary에 있고 messages에는 최근 원문만 남아 있다.) */
+function prependSummaryBanner(summary) {
+  const banner = document.createElement("details");
+  banner.className = "summary-banner";
+  const sm = document.createElement("summary");
+  sm.textContent = "🗜 이전 대화 요약 (압축됨)";
+  const body = document.createElement("div");
+  body.className = "content";
+  body.innerHTML = md(summary);
+  banner.append(sm, body);
+  messagesEl.insertBefore(banner, messagesEl.firstChild);
+  enhanceContent(banner);
 }
 
 function newChat() {
@@ -664,6 +1209,260 @@ function newChat() {
   loadConversations();
 }
 $("newChatBtn").addEventListener("click", newChat);
+
+/* ==================== 프로젝트 (프롬프트·기억 격리) ==================== */
+/* 사이드바는 인라인 아코디언 폴더 트리다: 프로젝트 폴더를 클릭하면 그 자리에서 펼쳐지며
+   해당 프로젝트의 대화가 중첩 리스트로 들여쓰기 되어 보인다. "일반 대화"(기본 공간)는
+   맨 아래 별도 섹션(#convList)이라, 프로젝트와 일반 대화를 한 화면에서 구분해 본다. */
+
+const expandedProjects = new Set();   // 펼쳐진 프로젝트 id (재렌더 사이 유지)
+
+/* #projectList를 프로젝트 폴더들로 다시 그린다. 활성 프로젝트는 자동으로 펼친다. */
+async function loadProjects() {
+  let projects = [];
+  try { projects = await (await fetch("/api/projects")).json(); }
+  catch (e) { projects = []; }
+  // 활성/펼침 상태가 삭제된 프로젝트를 가리키면 정리한다.
+  if (currentProjectId && !projects.some(p => p.id === currentProjectId)) currentProjectId = null;
+  const ids = new Set(projects.map(p => p.id));
+  for (const id of [...expandedProjects]) if (!ids.has(id)) expandedProjects.delete(id);
+
+  const box = $("projectList");
+  box.innerHTML = "";
+  if (!projects.length) {
+    const empty = document.createElement("div");
+    empty.className = "tree-empty";
+    empty.textContent = "아직 프로젝트가 없습니다. ＋로 만드세요.";
+    box.appendChild(empty);
+    return;
+  }
+  for (const p of projects) box.appendChild(makeProjectFolder(p));
+}
+
+/* 프로젝트 폴더 하나(헤더 + 중첩 대화 리스트). 헤더 클릭 = 그 프로젝트로 전환/펼치기,
+   이미 활성이면 접기/펴기 토글. ⚙ = 설정 모달. */
+function makeProjectFolder(p) {
+  const isActive = p.id === currentProjectId;
+  if (isActive) expandedProjects.add(p.id);   // 활성 프로젝트는 항상 펼쳐 둔다
+  const expanded = expandedProjects.has(p.id);
+
+  const wrap = document.createElement("div");
+  wrap.className = "project-folder";
+
+  const head = document.createElement("div");
+  head.className = "folder-head" + (isActive ? " active" : "");
+  const caret = document.createElement("span");
+  caret.className = "caret";
+  caret.textContent = expanded ? "▾" : "▸";
+  const name = document.createElement("span");
+  name.className = "folder-name";
+  name.textContent = p.name;
+  if (p.has_prompt) name.title = "프로젝트 프롬프트 있음";
+  const count = document.createElement("span");
+  count.className = "folder-count";
+  if (p.conversation_count) count.textContent = p.conversation_count;
+  const gear = document.createElement("button");
+  gear.className = "gear";
+  gear.textContent = "⚙";
+  gear.title = "프로젝트 설정 (이름·프롬프트·기억)";
+  gear.addEventListener("click", (e) => { e.stopPropagation(); openProjectSettings(p.id); });
+  head.append(caret, name, count, gear);
+
+  const kids = document.createElement("ul");
+  kids.className = "folder-convs";
+  if (!expanded) kids.classList.add("hidden");
+
+  head.addEventListener("click", async () => {
+    if (p.id === currentProjectId) {
+      // 이미 활성 → 접기/펴기만 토글
+      if (expandedProjects.has(p.id)) expandedProjects.delete(p.id);
+      else expandedProjects.add(p.id);
+    } else {
+      // 다른 프로젝트로 전환: 활성 공간을 바꾸고 현재 대화를 비운다
+      currentProjectId = p.id;
+      expandedProjects.add(p.id);
+      newChat();
+    }
+    await loadConversations();
+  });
+
+  wrap.append(head, kids);
+  if (expanded) fillProjectConvs(kids, p.id);
+  return wrap;
+}
+
+/* 한 프로젝트의 대화들을 폴더 중첩 리스트에 채운다(지연 로드). */
+async function fillProjectConvs(ul, pid) {
+  ul.innerHTML = '<li class="tree-empty">불러오는 중…</li>';
+  let list = [];
+  try {
+    const q = `?project_id=${encodeURIComponent(pid)}`;
+    list = await (await fetch(`/api/conversations${q}`)).json();
+  } catch (e) { list = []; }
+  ul.innerHTML = "";
+  if (!list.length) {
+    ul.innerHTML = '<li class="tree-empty">대화 없음</li>';
+    return;
+  }
+  for (const meta of list) ul.appendChild(makeConvLi(meta, pid));
+}
+
+/* ＋ 새 프로젝트: 이름을 받아 만들고, 바로 그 프로젝트로 전환한 뒤 설정 모달을 연다. */
+$("newProjectBtn").addEventListener("click", async () => {
+  const name = prompt("새 프로젝트 이름:");
+  if (!name || !name.trim()) return;
+  try {
+    const res = await fetch("/api/projects", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ name: name.trim() }),
+    });
+    const proj = await res.json();
+    if (!res.ok) { showToast(proj.detail || "생성 실패", "bad"); return; }
+    currentProjectId = proj.id;
+    expandedProjects.add(proj.id);
+    newChat();
+    await loadConversations();
+    openProjectSettings(proj.id);   // 방금 만든 프로젝트의 프롬프트를 바로 채우게 연다
+  } catch (err) { showToast("프로젝트 생성 오류", "bad"); }
+});
+
+/* ----- 프로젝트 설정 모달 (이름·프롬프트·이 프로젝트 기억) -----
+   모달은 활성 공간과 무관하게 editingProjectId가 가리키는 프로젝트를 편집한다
+   (⚙는 활성 프로젝트를 바꾸지 않고 그 프로젝트 설정만 연다). */
+const projectModal = $("projectModal");
+let editingProjectId = null;
+
+async function openProjectSettings(pid) {
+  if (!pid) return;
+  editingProjectId = pid;
+  let meta = {};
+  try { meta = await (await fetch(`/api/projects/${pid}`)).json(); }
+  catch (e) { showToast("프로젝트를 불러오지 못했습니다.", "bad"); return; }
+  $("projectModalTitle").textContent = `프로젝트: ${meta.name || ""}`;
+  $("projectName").value = meta.name || "";
+  $("projectPrompt").value = meta.prompt || "";
+  $("projectModalMsg").textContent = "";
+  renderMemoryList(pid, $("projectMemList"), $("projectMemCount"));
+  projectModal.classList.remove("hidden");
+}
+function closeProjectModal() { projectModal.classList.add("hidden"); }
+
+$("projectModalClose").addEventListener("click", closeProjectModal);
+projectModal.addEventListener("click", (e) => { if (e.target === projectModal) closeProjectModal(); });
+
+$("projectSaveBtn").addEventListener("click", async () => {
+  if (!editingProjectId) return;
+  const name = $("projectName").value.trim();
+  const promptText = $("projectPrompt").value;
+  try {
+    const res = await fetch(`/api/projects/${editingProjectId}`, {
+      method: "PATCH", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ name: name || null, prompt: promptText }),
+    });
+    const meta = await res.json().catch(() => ({}));
+    if (!res.ok) { $("projectModalMsg").textContent = meta.detail || "저장 실패"; return; }
+    showToast("프로젝트를 저장했습니다.");
+    await loadProjects();
+    closeProjectModal();
+  } catch (e) { $("projectModalMsg").textContent = "저장 중 오류가 발생했습니다."; }
+});
+
+$("projectClearMemBtn").addEventListener("click", async () => {
+  if (!editingProjectId) return;
+  if (!confirm("이 프로젝트의 장기 기억을 모두 지울까요?\n다른 프로젝트·기본 공간 기억은 그대로입니다. 되돌릴 수 없습니다.")) return;
+  try {
+    const q = encodeURIComponent(editingProjectId);
+    const res = await fetch(`/api/memory?project_id=${q}`, { method: "DELETE" });
+    const r = await res.json().catch(() => ({}));
+    if (!res.ok) { showToast(r.detail || "비우기 실패", "bad"); return; }
+    showToast(`이 프로젝트 기억 ${r.deleted}건을 비웠습니다.`);
+    renderMemoryList(editingProjectId, $("projectMemList"), $("projectMemCount"));
+  } catch (e) { showToast("기억 비우기 오류", "bad"); }
+});
+
+$("projectDeleteBtn").addEventListener("click", async () => {
+  if (!editingProjectId) return;
+  if (!confirm("이 프로젝트를 삭제할까요?\n이 프로젝트의 모든 대화와 기억이 함께 삭제됩니다. 되돌릴 수 없습니다.")) return;
+  try {
+    const res = await fetch(`/api/projects/${editingProjectId}`, { method: "DELETE" });
+    const r = await res.json().catch(() => ({}));
+    if (!res.ok) { showToast(r.detail || "삭제 실패", "bad"); return; }
+    showToast("프로젝트를 삭제했습니다.");
+    if (editingProjectId === currentProjectId) { currentProjectId = null; newChat(); }
+    expandedProjects.delete(editingProjectId);
+    editingProjectId = null;
+    closeProjectModal();
+    await loadConversations();
+  } catch (e) { showToast("삭제 중 오류", "bad"); }
+});
+
+/* ----- 장기 기억 뷰어 (프로젝트 모달·설정 탭 공용) -----
+   저장된 사실을 그대로 보여주고 개별(✕) 삭제한다. pid=null이면 기본 공간. */
+async function renderMemoryList(pid, listEl, countEl) {
+  const q = pid ? `?project_id=${encodeURIComponent(pid)}` : "";
+  let data = { count: 0, items: [] };
+  try { data = await (await fetch(`/api/memory${q}`)).json(); }
+  catch (e) { if (countEl) countEl.textContent = "기억을 불러오지 못했습니다."; return; }
+  const scope = pid ? "이 프로젝트 기억" : "기억";
+  if (countEl) countEl.textContent = `${scope} ${data.count}건`;
+  if (!listEl) return;
+  listEl.innerHTML = "";
+  const items = data.items || [];
+  if (!items.length) {
+    const li = document.createElement("li");
+    li.className = "empty";
+    li.textContent = "아직 저장된 기억이 없습니다. 대화하면서 자동으로 쌓입니다.";
+    listEl.appendChild(li);
+    return;
+  }
+  for (const it of items) listEl.appendChild(makeMemLi(it, pid, listEl, countEl));
+}
+
+function makeMemLi(it, pid, listEl, countEl) {
+  const li = document.createElement("li");
+  const body = document.createElement("span");
+  body.className = "mem-text";
+  body.textContent = it.content || "";
+  if (it.kind && it.kind !== "fact") body.title = it.kind;
+  const del = document.createElement("button");
+  del.className = "del";
+  del.textContent = "✕";
+  del.title = "이 기억 삭제";
+  del.addEventListener("click", async () => {
+    if (!confirm("이 기억을 삭제할까요?\n되돌릴 수 없습니다.")) return;
+    const q = pid ? `?project_id=${encodeURIComponent(pid)}` : "";
+    const res = await fetch(`/api/memory/${it.id}${q}`, { method: "DELETE" });
+    if (!res.ok) { showToast("삭제 실패", "bad"); return; }
+    renderMemoryList(pid, listEl, countEl);   // 개수·목록 갱신
+  });
+  li.append(body, del);
+  return li;
+}
+
+/* 대화 압축(파괴적) — 앞부분을 요약으로 치환해 컨텍스트를 줄인다. 최근 몇 턴만 원문으로
+   남고 그 이전 메시지는 사라진다. 서버가 요약에 실패하면 원본은 그대로다. */
+$("compactBtn").addEventListener("click", async () => {
+  if (!currentConvId) { showToast("먼저 대화를 시작하세요.", "warn"); return; }
+  if (sending) { showToast("응답 생성 중에는 압축할 수 없습니다.", "warn"); return; }
+  if (!confirm(
+    "이 대화의 앞부분을 요약으로 압축할까요?\n" +
+    "최근 몇 턴만 원문으로 남고 그 이전 메시지는 사라집니다 (되돌릴 수 없음)."
+  )) return;
+  const btn = $("compactBtn");
+  const prev = btn.textContent;
+  btn.disabled = true; btn.textContent = "⏳";
+  try {
+    const res = await fetch(`/api/conversations/${currentConvId}/compact${projQuery()}`, { method: "POST" });
+    const result = await res.json().catch(() => ({}));
+    if (!res.ok) { showToast(result.detail || "압축 실패", "bad"); return; }
+    showToast(`${result.dropped}개 메시지를 요약으로 압축했습니다.`);
+    await openConversation(currentConvId);   // 줄어든 이력 + 요약 배너로 다시 그린다
+  } catch (e) {
+    showToast("압축 중 오류가 발생했습니다.", "bad");
+  } finally {
+    btn.disabled = false; btn.textContent = prev;
+  }
+});
 
 /* ==================== 파일 첨부 (📁 OS 네이티브 대화상자) ==================== */
 /* 서버가 로컬에서 도는 점을 이용해 OS 기본 '열기' 대화상자를 띄우고, 고른 원본
@@ -852,6 +1651,29 @@ function showToast(text, kind = "ok") {
   }, 2600);
 }
 
+/* 설정의 '장기 기억' 개수·내용 목록을 갱신한다(활성 공간 기준). 실패해도 조용히 물러선다.
+   내용 렌더링·개별 삭제는 프로젝트 모달과 같은 공용 renderMemoryList를 쓴다. */
+async function refreshMemoryCount() {
+  renderMemoryList(currentProjectId, $("memList"), $("memCount"));
+}
+
+/* 장기 기억 전체 비우기 (파괴적, 로컬 전용). memory.db의 모든 사실을 지운다. */
+$("clearMemoryBtn").addEventListener("click", async () => {
+  const scopeMsg = currentProjectId
+    ? "이 프로젝트의 모든 장기 기억을 지울까요?\n(다른 프로젝트·기본 공간 기억은 그대로입니다.)"
+    : "기본 공간의 모든 장기 기억을 지울까요?\n(프로젝트별 기억은 그대로입니다.)";
+  if (!confirm(scopeMsg + "\n되돌릴 수 없습니다. (진행 중인 대화는 그대로 남습니다.)")) return;
+  try {
+    const res = await fetch(`/api/memory${projQuery()}`, { method: "DELETE" });
+    const result = await res.json().catch(() => ({}));
+    if (!res.ok) { showToast(result.detail || "비우기 실패", "bad"); return; }
+    showToast(`장기 기억 ${result.deleted}건을 비웠습니다.`);
+    refreshMemoryCount();
+  } catch (e) {
+    showToast("기억을 비우는 중 오류가 발생했습니다.", "bad");
+  }
+});
+
 async function openSettings() {
   switchSettingsTab("chat");   // 열 때마다 첫 탭으로
   const cfg = await (await fetch("/api/settings")).json();
@@ -876,6 +1698,7 @@ async function openSettings() {
   editingProviders = (cfg.providers || []).map(p => ({ ...p }));
   renderProviderRows();
   $("settingsMsg").textContent = "";
+  refreshMemoryCount();
   const mcpCfg = await (await fetch("/api/mcp/config")).json();
   editingMcpServers = parseMcpConfig(mcpCfg.content);
   renderMcpRows();
@@ -1355,5 +2178,5 @@ $("shutdownBtn").addEventListener("click", async () => {
 /* ==================== 초기화 ==================== */
 
 loadStatus();
-loadConversations();
+loadConversations();   // 내부에서 loadProjects()도 호출해 사이드바 전체를 그린다
 inputEl.focus();

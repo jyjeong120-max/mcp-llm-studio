@@ -256,3 +256,24 @@ class MemoryStore:
     def count(self) -> int:
         with self._lock:
             return int(self.conn.execute("SELECT COUNT(*) FROM memories").fetchone()[0])
+
+    def clear(self) -> int:
+        """모든 기억을 지운다. 지운 개수를 반환한다 (🔴 되돌릴 수 없음).
+
+        FTS 인덱스는 memories_ad(AFTER DELETE) 트리거가 행마다 동기화하므로 본문만
+        지우면 된다. FTS5가 없는 저하 빌드는 트리거도 없지만 지울 인덱스도 없다.
+        """
+        with self._lock:
+            n = int(self.conn.execute("SELECT COUNT(*) FROM memories").fetchone()[0])
+            self.conn.execute("DELETE FROM memories")
+            self.conn.commit()
+        return n
+
+    def close(self) -> None:
+        """sqlite 연결을 닫는다. 프로젝트 삭제 시 memory.db 파일 잠금을 풀어 폴더를
+        지울 수 있게 하기 위함(Windows는 열린 핸들이 있으면 삭제가 막힌다)."""
+        with self._lock:
+            try:
+                self.conn.close()
+            except Exception:  # noqa: BLE001 — 이미 닫혔으면 무시
+                pass

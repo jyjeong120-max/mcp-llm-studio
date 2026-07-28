@@ -11,17 +11,24 @@ RAG 인덱스 **구성** CLI — 서빙(rag_server.py, MCP)과 의도적으로 �
        rag_server(MCP)를 내리고 실행할 것.
     2. 서빙 MCP는 읽기 전용(🟢)만 노출돼 모델이 인덱스를 건드릴 수 없다.
 
+인덱싱 대상은 Word(.docx/.doc)·PowerPoint(.pptx/.ppt)·PDF(.pdf)다. Word/PPT는 office
+COM으로, PDF는 pdf_server의 추출 체인(direct→word_com→reader_print)으로 읽는다.
+
+임베딩 서버 자동 기동: 폴더/파일 인덱싱 시, 이미 임베딩 서버가 떠 있지 않으면 루트
+rag_embed/ 폴더의 .gguf를 llama-server(--embeddings, CPU)로 잠깐 띄웠다가 인덱싱이
+끝나면 종료한다(우리가 띄운 것만). 모델/실행파일이 없으면 키워드 전용으로 저하한다.
+
 사용 (루트의 run_rag_indexer.bat 이 이 스크립트를 부른다):
     python rag_indexer.py C:\docs               # 폴더 인덱싱 (증분 — 변경된 파일만)
     python rag_indexer.py C:\docs --reindex     # 전부 다시 (임베딩 포함)
-    python rag_indexer.py --file C:\docs\a.docx # 파일 하나만 다시
+    python rag_indexer.py --file C:\docs\a.pptx # 파일 하나만 다시
     python rag_indexer.py --status              # 인덱스 상태 확인
     python rag_indexer.py --clear               # 삭제 프리뷰 (실행 안 함)
     python rag_indexer.py --clear --yes         # 인덱스 전체 삭제
+    python rag_indexer.py C:\docs --no-embed-server        # 임베딩 서버 자동 기동 안 함
+    python rag_indexer.py C:\docs --embed-model C:\m.gguf  # 임베딩 모델 직접 지정
 
-Word COM을 쓰므로 office_server와 같은 제약: Windows + Office, 사용자가 로그인한
-세션에서 실행. 임베딩 서버(llama-server --embeddings)가 꺼져 있으면 키워드 인덱스만
-만들고, 나중에 서버를 켜고 --reindex 하면 벡터가 붙는다.
+Word/PPT는 office_server와 같은 제약: Windows + Office, 사용자가 로그인한 세션에서 실행.
 """
 
 from __future__ import annotations
@@ -32,6 +39,7 @@ import sys
 import time
 
 import rag_core as core
+import rag_llama
 from rag_core import DOC_PATTERNS, EMBED_BATCH, OfficeError, RagError, RagStore
 
 
@@ -39,7 +47,7 @@ from rag_core import DOC_PATTERNS, EMBED_BATCH, OfficeError, RagError, RagStore
 
 
 def _iter_doc_files(folder: str) -> list[str]:
-    """폴더(재귀)에서 인덱싱 대상 Word 파일 목록. Office 임시 파일(~$)은 제외."""
+    """폴더(재귀)에서 인덱싱 대상 파일 목록(Word/PPT/PDF). Office 임시 파일(~$)은 제외."""
     found = []
     for root, _dirs, names in os.walk(folder):
         for name in names:
@@ -56,7 +64,7 @@ def _index_one_file(store: RagStore, path: str, password: str = "",
     st = os.stat(path)
     if not reindex and store.file_unchanged(path, st.st_mtime, st.st_size):
         return "변경 없음 — 건너뜀"
-    text = core._extract_word_text(path, password)
+    text = core._extract_text(path, password)  # 확장자에 맞는 추출기(Word/PPT/PDF)로 분기
     chunks = core._chunk_text(text)  # [(섹션경로, 본문), ...]
     if not chunks:
         store.replace_file(path, st.st_mtime, st.st_size, [], None)
@@ -69,7 +77,7 @@ def _index_one_file(store: RagStore, path: str, password: str = "",
     if use_embed is not False:
         vectors = []
         for i in range(0, len(embed_texts), EMBED_BATCH):
-            batch = core._embed_texts(embed_texts[i:i + EMBED_BATCH])
+            batch = core._embed_texts(embed_texts[i:i + EMBED_BATCH], warn=True)
             if batch is None:
                 vectors = None  # 서버 죽음/오류 → 이 파일은 키워드 전용으로 저장
                 break
@@ -80,7 +88,7 @@ def _index_one_file(store: RagStore, path: str, password: str = "",
 
 
 def index_folder(folder: str, reindex: bool = False, prune: bool = True, password: str = "") -> str:
-    """폴더(하위 포함)의 Word 문서를 모두 인덱싱하고 결과 요약을 돌려준다.
+    """폴더(하위 포함)의 문서(Word/PPT/PDF)를 모두 인덱싱하고 결과 요약을 돌려준다.
 
     원본 문서는 읽기만 하고 인덱스 파일에만 쓴다. 수정 시각·크기가 같은 파일은
     건너뛴다(증분). prune=True면 폴더에서 사라진 파일을 인덱스에서도 정리한다.
@@ -88,10 +96,15 @@ def index_folder(folder: str, reindex: bool = False, prune: bool = True, passwor
     root = os.path.abspath(os.path.expanduser(folder))
     if not os.path.isdir(root):
         raise RagError(f"'{root}' 폴더가 없습니다. 경로를 확인하세요.")
-    core._require_word()
     files = _iter_doc_files(root)
     if not files:
-        return f"'{root}' 아래에 Word 문서(.docx/.doc)가 없습니다."
+        exts = "/".join(DOC_PATTERNS)
+        return f"'{root}' 아래에 인덱싱할 문서({exts})가 없습니다."
+    # Word/PPT는 COM이 필요하다(PDF는 direct 백엔드로 COM 없이도 됨) — COM이 없으면
+    # 해당 파일들은 개별적으로 실패 처리되고 나머지(PDF direct)는 계속 진행한다.
+    if any(os.path.splitext(f)[1].lower() in core.WORD_PATTERNS + core.PPT_PATTERNS
+           for f in files):
+        core._require_word()
 
     store = core.get_store()
     embed_ok = core._embed_available()
@@ -129,13 +142,13 @@ def index_folder(folder: str, reindex: bool = False, prune: bool = True, passwor
 
 
 def index_file(path: str, password: str = "") -> str:
-    """Word 문서 하나를 (다시) 인덱싱하고 결과 요약을 돌려준다."""
+    """문서(Word/PPT/PDF) 하나를 (다시) 인덱싱하고 결과 요약을 돌려준다."""
     p = os.path.abspath(os.path.expanduser(path))
     if not os.path.isfile(p):
         raise RagError(f"'{p}' 파일이 없습니다. 경로를 확인하세요.")
     if os.path.splitext(p)[1].lower() not in DOC_PATTERNS:
-        raise RagError(f"Word 문서(.docx/.doc)만 인덱싱합니다: {os.path.basename(p)}")
-    core._require_word()
+        exts = "/".join(DOC_PATTERNS)
+        raise RagError(f"인덱싱 대상 형식({exts})이 아닙니다: {os.path.basename(p)}")
     store = core.get_store()
     note = _index_one_file(store, p, password, reindex=True, use_embed=None)
     return f"인덱싱 완료: {os.path.basename(p)} — {note}"
@@ -178,6 +191,12 @@ def main() -> None:
                         help=f"Qdrant 로컬 데이터 폴더 (기본 {core.QDRANT_PATH})")
     parser.add_argument("--embed-url", default=None,
                         help=f"임베딩 서버 /v1 베이스 URL (기본 {core.EMBED_URL})")
+    parser.add_argument("--embed-model", default=None,
+                        help="임베딩 GGUF 경로 (기본: 루트 rag_embed/의 유일한 .gguf 자동 선택)")
+    parser.add_argument("--server-bin", default=None,
+                        help="llama-server 실행 파일 (기본: LLAMA_SERVER_BIN > rag_embed/ > PATH)")
+    parser.add_argument("--no-embed-server", action="store_true",
+                        help="임베딩 서버를 자동 기동하지 않음 (이미 떠 있으면 그것만 사용)")
     args = parser.parse_args()
 
     if args.db:
@@ -211,15 +230,18 @@ def main() -> None:
             print(f"인덱스를 비웠습니다 (파일 {nf}개, 청크 {nc}개 삭제). 원본 문서는 그대로입니다.")
             return
 
-        if args.file:
+        if args.file or args.folder:
             _require_qdrant_or_exit(core.get_store())
-            print(index_file(args.file, password=args.password))
-            return
-
-        if args.folder:
-            _require_qdrant_or_exit(core.get_store())
-            print(index_folder(args.folder, reindex=args.reindex,
-                               prune=not args.no_prune, password=args.password))
+            # 임베딩 서버를 자동 기동(rag_embed의 모델) → 인덱싱 → 종료. 모델/바이너리가
+            # 없거나 --no-embed-server면 키워드 전용으로 저하한다(spawn=False면 재사용만).
+            with rag_llama.make_embed_server(
+                    args.embed_model, args.server_bin, spawn=not args.no_embed_server,
+                    degrade_note="키워드 전용으로 인덱싱합니다"):
+                if args.file:
+                    print(index_file(args.file, password=args.password))
+                else:
+                    print(index_folder(args.folder, reindex=args.reindex,
+                                       prune=not args.no_prune, password=args.password))
             return
 
         parser.print_help()
@@ -227,6 +249,9 @@ def main() -> None:
         print(f"[오류] {e}", file=sys.stderr)
         sys.exit(1)
     finally:
+        # Qdrant 로컬 클라이언트를 살아 있을 때 명시적으로 닫는다 — 안 그러면 종료 중
+        # __del__이 뒤늦게 돌며 "ImportError: sys.meta_path is None" 잡음을 남긴다.
+        core.close_store()
         if core.pythoncom is not None:
             core.pythoncom.CoUninitialize()
 

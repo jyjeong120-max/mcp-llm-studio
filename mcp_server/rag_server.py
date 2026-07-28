@@ -27,12 +27,14 @@ llm_studio 장착 (코드 변경 불필요): 데이터 폴더의 mcp_servers.jso
 from __future__ import annotations
 
 import argparse
+import atexit
 import os
 import sys
 
 from fastmcp import FastMCP
 
 import rag_core as core
+import rag_llama
 from rag_core import MAX_RESULT_CHARS, RRF_K, RagError, rag_tool
 
 mcp = FastMCP(
@@ -170,6 +172,18 @@ if __name__ == "__main__":
                         help=f"임베딩 서버 /v1 베이스 URL (기본 {core.EMBED_URL})")
     parser.add_argument("--rerank-url", default=None,
                         help=f"리랭커 서버 /v1 베이스 URL (기본 {core.RERANK_URL}, 없으면 리랭크 건너뜀)")
+    # 서빙 시 임베딩(:8001)·리랭커(:8002) llama-server를 백그라운드로 자동 기동한다.
+    # 모델(rag_embed/·rag_rerank/의 gguf)이나 실행파일이 없으면 조용히 저하한다.
+    parser.add_argument("--no-embed-server", action="store_true",
+                        help="임베딩 서버를 자동 기동하지 않음 (이미 떠 있으면 그것만 사용)")
+    parser.add_argument("--no-rerank-server", action="store_true",
+                        help="리랭커 서버를 자동 기동하지 않음 (이미 떠 있으면 그것만 사용)")
+    parser.add_argument("--embed-model", default=None,
+                        help="임베딩 GGUF 경로 (기본: rag_embed/의 유일한 .gguf 자동 선택)")
+    parser.add_argument("--rerank-model", default=None,
+                        help="리랭커 GGUF 경로 (기본: rag_rerank/의 유일한 .gguf 자동 선택)")
+    parser.add_argument("--server-bin", default=None,
+                        help="llama-server 실행 파일 (기본: LLAMA_SERVER_BIN > rag_embed/rag_rerank > PATH)")
     parser.add_argument(
         "--transport", choices=["stdio", "http", "sse"],
         default=os.getenv("RAG_MCP_TRANSPORT", "stdio"),
@@ -178,6 +192,10 @@ if __name__ == "__main__":
     parser.add_argument("--host", default=os.getenv("RAG_MCP_HOST", "127.0.0.1"))
     parser.add_argument("--port", type=int, default=int(os.getenv("RAG_MCP_PORT", "8090")))
     args = parser.parse_args()
+
+    # 종료 시 Qdrant 로컬 클라이언트를 명시적으로 닫는다 — 안 그러면 종료 중 __del__이
+    # 뒤늦게 돌며 "ImportError: sys.meta_path is None / msvcrt halted" 잡음을 남긴다.
+    atexit.register(core.close_store)
 
     if args.db:
         core.DB_PATH = os.path.abspath(os.path.expanduser(args.db))
@@ -190,8 +208,22 @@ if __name__ == "__main__":
 
     if args.search:
         # CLI 모드: 도구 함수를 직접 호출한다 (rag_tool 데코레이터가 예외를 처리).
+        # 단발 진단이라 자동 기동은 하지 않는다(이미 떠 있는 서버가 있으면 그대로 사용).
         print(search_docs(args.search, top_k=args.top_k))
         sys.exit(0)
+
+    # 서빙 시작 전, 임베딩(:8001)·리랭커(:8002) llama-server를 백그라운드로 자동 기동한다.
+    # 모델 로드(수십 초)가 MCP 핸드셰이크를 막지 않게 별도 스레드에서 띄우고, 프로세스 종료
+    # 시 우리가 띄운 것만 정리한다(atexit). 준비 전 검색은 우아하게 저하했다가 준비되면
+    # 자동으로 하이브리드·리랭크가 붙는다. 모델/실행파일이 없으면 조용히 저하한다.
+    backends = []
+    if not args.no_embed_server:
+        backends.append(rag_llama.make_embed_server(
+            args.embed_model, args.server_bin, degrade_note="키워드 전용으로 검색합니다"))
+    if not args.no_rerank_server:
+        backends.append(rag_llama.make_rerank_server(args.rerank_model, args.server_bin))
+    if backends:
+        rag_llama.start_in_background(backends)
 
     if args.transport in ("http", "sse"):
         path = "/mcp/" if args.transport == "http" else "/sse/"

@@ -42,6 +42,7 @@ from server.files import UploadStore
 from server.llama_proc import LlamaServer, LlamaServerError
 from server.mcp_client import MCPManager
 from server.memory import MemoryStore
+from server.projects import ProjectManager
 
 
 def build_state(args) -> SimpleNamespace:
@@ -54,13 +55,18 @@ def build_state(args) -> SimpleNamespace:
     if args.llama_url:
         config["llama_external_url"] = args.llama_url
 
+    # 기본 공간(프로젝트 없음)의 대화·메모리 스토어. 프로젝트 매니저가 이걸 기본값으로 물고,
+    # 프로젝트별 스토어는 projects/<id>/ 폴더로 따로 만든다.
+    store = ConversationStore(data_dir)
+    memory = MemoryStore(data_dir)
     state = SimpleNamespace(
         data_dir=data_dir,
         config=config,
         llama=LlamaServer(data_dir),
         mcp=MCPManager(mcp_config_path(data_dir)),
-        store=ConversationStore(data_dir),
-        memory=MemoryStore(data_dir),
+        store=store,
+        memory=memory,
+        projects=ProjectManager(data_dir, store, memory),
         uploads=UploadStore(data_dir),
         mock=False,
         mock_reason=None,

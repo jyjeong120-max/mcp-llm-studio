@@ -31,6 +31,7 @@ from pydantic import BaseModel
 
 from . import agent, planner
 from .approvals import ApprovalBroker
+from .steering import SteeringBroker
 from .config import RESTART_KEYS, save_config, static_dir
 
 ATTACH_MAX_CHARS = 30_000  # 첨부 파일당 프롬프트에 넣는 텍스트 한도
@@ -39,9 +40,14 @@ ATTACH_MAX_CHARS = 30_000  # 첨부 파일당 프롬프트에 넣는 텍스트 �
 class ChatRequest(BaseModel):
     message: str
     conversation_id: str | None = None
+    # 활성 프로젝트. None/빈값이면 "기본" 공간(루트 스토어). 프로젝트별로 대화·메모리·
+    # 시스템 프롬프트가 격리된다.
+    project_id: str | None = None
     attachments: list[str] = []
     provider: str | None = None  # None이면 config의 active_provider 사용
-    task_mode: bool = False      # True면 계획-실행(다단계)으로 처리 ('작업 모드')
+    # 처리 모드: "auto"(라우터가 작업/채팅 자동 분류) · "task"(강제 작업) · "chat"(강제 채팅).
+    # 사용자가 🧭 버튼으로 고른다. 강제 모드는 라우터를 건너뛴다(결정성·지연 절약).
+    mode: str = "auto"
 
 
 def _resolve_provider(state, name: str | None) -> dict:
@@ -79,9 +85,29 @@ class RenameRequest(BaseModel):
     title: str
 
 
+class ProjectCreateRequest(BaseModel):
+    name: str
+    prompt: str = ""
+
+
+class ProjectUpdateRequest(BaseModel):
+    # None이면 그 필드는 바꾸지 않는다(이름만/프롬프트만 수정 가능).
+    name: str | None = None
+    prompt: str | None = None
+
+
 class ApproveRequest(BaseModel):
     id: str          # approval_request 이벤트로 받은 요청 id
     approved: bool   # True=승인(실행), False=거절(실행 안 함)
+
+
+class SteerRequest(BaseModel):
+    id: str          # steer_request 이벤트로 받은 요청 id
+    # 계획 게이트: "run"(그대로) · "edit"(steps로 교체) · "abort"(취소)
+    # 실패 게이트: "retry" · "skip" · "replan" · "edit"(step로 교체 후 재시도) · "abort"
+    action: str
+    steps: list[str] | None = None  # action=="edit"(계획 게이트)일 때 편집된 단계 목록
+    step: str | None = None         # action=="edit"(실패 게이트)일 때 편집된 단계 한 줄
 
 
 class MCPConfigRequest(BaseModel):
@@ -102,6 +128,8 @@ def create_app(state) -> FastAPI:
 
     # 위험 도구 승인 브로커 — 상태는 전부 RAM (대화 저장과 무관, 재시작하면 초기화).
     approvals = ApprovalBroker()
+    # 작업 조종 브로커 — 계획/실패 게이트에서 사람의 결정을 받는다(승인과 같은 RAM 원칙).
+    steering = SteeringBroker()
 
     # ---------- 상태 ----------
 
@@ -154,24 +182,55 @@ def create_app(state) -> FastAPI:
                 headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
             )
 
-        conv = state.store.load(req.conversation_id) if req.conversation_id else None
+        # 활성 프로젝트의 대화·메모리 스토어와 기본 프롬프트를 해석한다(프로젝트 없으면
+        # 기본 공간). 이 아래로는 state.store/state.memory 대신 이 지역 변수를 쓴다.
+        store, memory = state.projects.stores(req.project_id)
+        base_prompt = state.projects.base_prompt(req.project_id, state.config["system_prompt"])
+
+        conv = store.load(req.conversation_id) if req.conversation_id else None
         if conv is None:
-            conv = state.store.create(state.store.title_from(req.message))
+            conv = store.create(store.title_from(req.message))
 
         user_content = _with_attachments(state, req.message, req.attachments)
         conv["messages"].append({"role": "user", "content": user_content})
 
         # 회상(읽기): 원본 메시지로 관련 기억을 찾아 system에 주입한다. 검색 질의는
-        # 첨부 텍스트가 아니라 사용자가 친 원문(req.message)을 쓴다.
+        # 첨부 텍스트가 아니라 사용자가 친 원문(req.message)을 쓴다. 프로젝트 메모리만 대상.
         memory_enabled = state.config.get("memory_enabled", True)
-        system_content = _build_system(state, req.message)
+        system_content = _build_system(state, req.message, memory, base_prompt)
+        # 압축된 대화면 요약을 system에 덧붙인다(별도 system 메시지가 아니라 하나로 합친다 —
+        # Gemma 등 템플릿이 system 블록을 하나만 기대하는 경우를 피하기 위해). compact
+        # 엔드포인트가 오래된 메시지를 여기 요약으로 치환해 두었다.
+        if conv.get("summary"):
+            system_content += (
+                "\n\n[이전 대화 요약] 아래는 대화가 길어져 압축한 이전 내용의 요약이다. "
+                "이어서 답할 때 문맥으로 참고하라.\n" + conv["summary"]
+            )
         msgs = [{"role": "system", "content": system_content}, *conv["messages"]]
-        mem = state.memory if memory_enabled else None
+        mem = memory if memory_enabled else None
 
-        # 라우터: 작업 모드 요청이면 계획-실행으로 분기한다. 단순 대화는 기존 경로.
-        # 목 모드에선 계획을 세울 수 없으므로 항상 일반 채팅으로 처리한다.
-        use_task = (req.task_mode and not provider["mock"]
-                    and state.config.get("task_mode_enabled", True))
+        # 라우터(의도 판단 노드): mode에 따라 계획-실행(run_task)과 일반 채팅(run_chat)으로
+        # 분기한다. "auto"는 라우터가 자동 분류하고, "task"/"chat"은 사용자가 강제한 것이라
+        # 라우터를 건너뛴다. 목 모드에선 계획을 세울 수 없으므로 항상 채팅으로 처리한다.
+        task_ok = state.config.get("task_mode_enabled", True) and not provider["mock"]
+        mode = (req.mode or "auto").lower()
+        route_reason = ""
+        if not task_ok:
+            use_task = False
+        elif mode == "task":
+            use_task, route_reason = True, "사용자 지정 · 작업"
+        elif mode == "chat":
+            use_task, route_reason = False, "사용자 지정 · 채팅"
+        elif state.config.get("task_router_enabled", True):
+            label = await planner.classify_intent(
+                base_url=provider["base_url"], model=provider["model"],
+                api_key=provider["api_key"], send_top_k=provider["send_top_k"],
+                messages=msgs)
+            use_task = (label == "task")
+            route_reason = f"자동 분류 · {'작업' if use_task else '채팅'}"
+        else:
+            use_task, route_reason = False, "자동(라우터 꺼짐) · 채팅"
+
         if use_task:
             runner = planner.run_task(
                 base_url=provider["base_url"], model=provider["model"],
@@ -179,7 +238,11 @@ def create_app(state) -> FastAPI:
                 messages=msgs, settings=state.config, mcp=state.mcp, memory=mem,
                 max_steps=int(state.config.get("task_max_steps", 10)),
                 max_replans=int(state.config.get("task_max_replans", 2)),
-                approver=approvals,
+                approver=approvals, steerer=steering,
+                plan_gate=state.config.get("task_plan_gate", False),
+                failure_gate=state.config.get("task_failure_gate", True),
+                branch_enabled=state.config.get("task_branch_enabled", True),
+                steer_timeout=float(state.config.get("task_steer_timeout", 600)),
             )
         else:
             runner = agent.run_chat(
@@ -191,6 +254,11 @@ def create_app(state) -> FastAPI:
 
         async def event_stream():
             yield _sse({"type": "meta", "conversation_id": conv["id"], "title": conv["title"]})
+            # 라우팅 결과를 코크핏의 0번 노드로 알린다(작업 판단이 났을 때만 — 일반
+            # 채팅 UX는 그대로 두기 위해). reason은 사람이 오분류를 알아채도록 표시.
+            if task_ok and (use_task or mode != "chat"):
+                yield _sse({"type": "route", "use_task": use_task,
+                            "mode": mode, "reason": route_reason})
             streamed: list[str] = []
             finished = False
             try:
@@ -211,11 +279,12 @@ def create_app(state) -> FastAPI:
                     conv["messages"].append(
                         {"role": "assistant", "content": "".join(streamed) + "\n\n*(중단됨)*"}
                     )
-                state.store.save(conv)
+                store.save(conv)
                 # 쓰기(자동요약): 정상 완료된 턴에서만, 트리거가 맞으면 사실을 추출해 저장한다.
                 # 사용자는 이미 응답을 다 받았으므로 여기서의 지연은 스트림 종료만 늦춘다.
+                # 사실은 이 프로젝트 메모리에만 저장(완전 격리).
                 if finished:
-                    await _maybe_autosummarize(state, conv, provider)
+                    await _maybe_autosummarize(state, conv, provider, store, memory)
 
         return StreamingResponse(
             event_stream(),
@@ -233,44 +302,147 @@ def create_app(state) -> FastAPI:
             raise HTTPException(404, "해당 승인 요청이 없습니다 (이미 처리됐거나 시간 초과).")
         return {"ok": True}
 
+    @app.post("/api/chat/steer")
+    async def steer(req: SteerRequest, request: Request):
+        """작업 조종 게이트(steer_request)에 대한 사용자의 결정을 반영한다.
+
+        승인과 같은 이유로 로컬 접속에서만 허용한다(0.0.0.0 공개 시 원격이 남의
+        작업 흐름을 대신 조작하지 못하게 — id도 추측 불가 토큰이지만 이중 방어).
+        """
+        _require_local(request)
+        decision = {"action": req.action, "steps": req.steps, "step": req.step}
+        if not steering.resolve(req.id, decision):
+            raise HTTPException(404, "해당 조종 요청이 없습니다 (이미 처리됐거나 시간 초과).")
+        return {"ok": True}
+
+    # ---------- 프로젝트 ----------
+    # 프로젝트별로 프롬프트와 메모리를 격리한다. project_id가 falsy면 "기본" 공간(루트 스토어).
+    # 대화·메모리 엔드포인트는 project_id 쿼리로 그 프로젝트 스토어에 라우팅한다.
+
+    @app.get("/api/projects")
+    async def list_projects():
+        return state.projects.list()
+
+    @app.post("/api/projects")
+    async def create_project(req: ProjectCreateRequest):
+        return state.projects.create(req.name, req.prompt or "")
+
+    @app.get("/api/projects/{project_id}")
+    async def get_project(project_id: str):
+        meta = state.projects.get(project_id)
+        if meta is None:
+            raise HTTPException(404, "프로젝트를 찾을 수 없습니다.")
+        return meta
+
+    @app.patch("/api/projects/{project_id}")
+    async def update_project(project_id: str, req: ProjectUpdateRequest):
+        meta = state.projects.update(project_id, name=req.name, prompt=req.prompt)
+        if meta is None:
+            raise HTTPException(404, "프로젝트를 찾을 수 없습니다.")
+        return meta
+
+    @app.delete("/api/projects/{project_id}")
+    async def delete_project(project_id: str, request: Request):
+        """프로젝트를 폴더째 삭제한다(대화·메모리 포함, 🔴 되돌릴 수 없음). 로컬 접속 전용."""
+        _require_local(request)
+        if not state.projects.delete(project_id):
+            raise HTTPException(404, "프로젝트를 찾을 수 없습니다.")
+        return {"ok": True}
+
     # ---------- 대화 기록 ----------
 
     @app.get("/api/conversations")
-    async def list_conversations():
-        return state.store.list()
+    async def list_conversations(project_id: str | None = None):
+        return state.projects.stores(project_id)[0].list()
 
     @app.get("/api/conversations/{conv_id}")
-    async def get_conversation(conv_id: str):
-        conv = state.store.load(conv_id)
+    async def get_conversation(conv_id: str, project_id: str | None = None):
+        conv = state.projects.stores(project_id)[0].load(conv_id)
         if conv is None:
             raise HTTPException(404, "대화를 찾을 수 없습니다.")
         return conv
 
     @app.delete("/api/conversations/{conv_id}")
-    async def delete_conversation(conv_id: str):
-        if not state.store.delete(conv_id):
+    async def delete_conversation(conv_id: str, project_id: str | None = None):
+        if not state.projects.stores(project_id)[0].delete(conv_id):
             raise HTTPException(404, "대화를 찾을 수 없습니다.")
         return {"ok": True}
 
     @app.post("/api/conversations/{conv_id}/rename")
-    async def rename_conversation(conv_id: str, req: RenameRequest):
-        if not state.store.rename(conv_id, req.title):
+    async def rename_conversation(conv_id: str, req: RenameRequest,
+                                  project_id: str | None = None):
+        if not state.projects.stores(project_id)[0].rename(conv_id, req.title):
             raise HTTPException(404, "대화를 찾을 수 없습니다.")
         return {"ok": True}
+
+    @app.post("/api/conversations/{conv_id}/compact")
+    async def compact_conversation(conv_id: str, request: Request,
+                                   project_id: str | None = None):
+        """대화 앞부분을 요약으로 치환해 컨텍스트를 줄인다 (🔴 원본 메시지는 사라짐).
+
+        최근 몇 턴은 원문 그대로 두고 그 이전을 LLM 요약 한 덩어리로 바꾼다. 요약은
+        conv["summary"]에 저장돼 다음 요청부터 system 프롬프트로 주입된다(파괴적 압축).
+        요약 실패 시에는 원본을 건드리지 않는다. 승인·조종과 같은 이유로 로컬 접속 전용.
+        """
+        _require_local(request)
+        store = state.projects.stores(project_id)[0]
+        conv = store.load(conv_id)
+        if conv is None:
+            raise HTTPException(404, "대화를 찾을 수 없습니다.")
+
+        provider = _resolve_provider(state, None)  # 압축은 현재 활성 모델로 요약한다
+        if provider["mock"]:
+            raise HTTPException(400, "목 모드에서는 압축할 수 없습니다. 모델을 서빙한 뒤 시도하세요.")
+        if provider["name"] == "local" and not state.llama.ready:
+            raise HTTPException(400, "로컬 모델이 준비되지 않았습니다. 서빙을 시작한 뒤 시도하세요.")
+
+        keep = max(1, int(state.config.get("compact_keep_recent_turns", 4)))
+        prefix, tail = _split_for_compaction(conv.get("messages", []), keep)
+        if prefix is None or tail is None:
+            raise HTTPException(400, f"압축할 만큼 길지 않습니다 (최근 {keep}턴은 원문으로 유지합니다).")
+
+        summary = await agent.summarize_conversation(
+            base_url=provider["base_url"], model=provider["model"],
+            api_key=provider["api_key"], send_top_k=provider["send_top_k"],
+            messages=prefix, prior_summary=str(conv.get("summary", "") or ""),
+        )
+        if not summary:
+            raise HTTPException(502, "요약 생성에 실패했습니다. 잠시 후 다시 시도하세요 (원본은 그대로입니다).")
+
+        dropped = len(prefix)
+        conv["summary"] = summary
+        conv["messages"] = tail
+        # 자동요약 성장 기준을 압축 후 크기로 리셋 — 안 하면 다음 트리거 계산이 어긋난다.
+        conv["memory_summarized_turn"] = sum(1 for m in tail if m.get("role") == "user")
+        conv["memory_summarized_chars"] = sum(len(str(m.get("content") or "")) for m in tail)
+        store.save(conv)
+        return {"ok": True, "dropped": dropped, "kept": len(tail), "summary": summary}
 
     # ---------- 장기 메모리 (조회·삭제) ----------
     # 사용자가 어시스턴트가 무엇을 기억하는지 보고 지울 수 있어야 한다 (신뢰·프라이버시).
     # 폴리시된 관리 UI는 fast-follow. 여기서는 최소 API만 노출한다.
 
     @app.get("/api/memory")
-    async def list_memory():
-        return {"count": state.memory.count(), "items": state.memory.all()}
+    async def list_memory(project_id: str | None = None):
+        memory = state.projects.stores(project_id)[1]
+        return {"count": memory.count(), "items": memory.all()}
 
     @app.delete("/api/memory/{mem_id}")
-    async def delete_memory(mem_id: int):
-        if not state.memory.delete(mem_id):
+    async def delete_memory(mem_id: int, request: Request, project_id: str | None = None):
+        """장기 기억 하나를 삭제한다 (🔴 되돌릴 수 없음). 전체 비우기와 같은 로컬 접속 전용 게이트.
+        project_id가 있으면 그 프로젝트 메모리에서만 지운다(완전 격리)."""
+        _require_local(request)
+        if not state.projects.stores(project_id)[1].delete(mem_id):
             raise HTTPException(404, "해당 기억을 찾을 수 없습니다.")
         return {"ok": True}
+
+    @app.delete("/api/memory")
+    async def clear_memory(request: Request, project_id: str | None = None):
+        """장기 기억을 전부 삭제한다 (🔴 되돌릴 수 없음). 대량 파괴이므로 로컬 접속 전용.
+        project_id가 있으면 그 프로젝트 메모리만 비운다(완전 격리)."""
+        _require_local(request)
+        deleted = state.projects.stores(project_id)[1].clear()
+        return {"ok": True, "deleted": deleted}
 
     # ---------- 파일 첨부 ----------
 
@@ -438,19 +610,20 @@ def create_app(state) -> FastAPI:
     return app
 
 
-def _build_system(state, query: str) -> str:
-    """system 프롬프트에 관련 장기 기억을 [기억] 블록으로 덧붙인다.
+def _build_system(state, query: str, memory, base_prompt: str) -> str:
+    """system 프롬프트(base_prompt)에 관련 장기 기억을 [기억] 블록으로 덧붙인다.
 
-    회상(읽기)은 모델의 도구 호출에 맡기지 않고 하네스가 매 턴 결정적으로 주입한다
-    (약한 로컬 모델도 확실히 기억을 참고하도록). 메모리가 꺼져 있거나 검색이
-    실패하거나 관련 기억이 없으면 원래 프롬프트를 그대로 쓴다 — 우아하게 저하한다.
+    base_prompt는 활성 프로젝트의 프롬프트(없으면 전역), memory는 그 프로젝트의 메모리다
+    (완전 격리 — 다른 프로젝트 기억은 섞이지 않는다). 회상(읽기)은 모델의 도구 호출에
+    맡기지 않고 하네스가 매 턴 결정적으로 주입한다(약한 로컬 모델도 확실히 참고하도록).
+    메모리가 꺼져 있거나 검색이 실패하거나 관련 기억이 없으면 base_prompt를 그대로 쓴다.
     """
-    base = state.config["system_prompt"]
+    base = base_prompt
     if not state.config.get("memory_enabled", True):
         return base
     try:
         top_k = int(state.config.get("memory_recall_top_k", 5))
-        hits = state.memory.search(query, top_k)
+        hits = memory.search(query, top_k)
     except Exception as e:  # noqa: BLE001 — 검색 실패가 채팅을 막지 않게 한다
         print(f"[주의] 메모리 검색 실패, 기억 없이 진행합니다: {e}")
         return base
@@ -465,8 +638,24 @@ def _build_system(state, query: str) -> str:
     )
 
 
-async def _maybe_autosummarize(state, conv: dict, provider: dict) -> None:
+def _split_for_compaction(messages: list[dict], keep_recent_turns: int):
+    """messages를 (요약할 앞부분, 원문으로 남길 최근부분)으로 가른다.
+
+    tail은 반드시 user 메시지 경계에서 시작한다 — 그래야 assistant.tool_calls와
+    role=tool 결과 쌍이 중간에서 끊겨 전송 규격이 깨지는 일이 없다. 최근 user 턴이
+    keep_recent_turns 이하이면 압축할 게 없어 (None, None)을 돌려준다.
+    """
+    user_idxs = [i for i, m in enumerate(messages) if m.get("role") == "user"]
+    if len(user_idxs) <= keep_recent_turns:
+        return None, None
+    cut = user_idxs[-keep_recent_turns]
+    return messages[:cut], messages[cut:]
+
+
+async def _maybe_autosummarize(state, conv: dict, provider: dict, store, memory) -> None:
     """트리거가 맞으면 대화에서 사실을 추출해 장기 메모리에 저장한다 (쓰기·자동 경로).
+
+    store·memory는 이 대화가 속한 프로젝트의 스토어다(사실은 그 프로젝트 메모리에만 저장).
 
     트리거는 '지난 요약 이후' 성장분 기준이다 — 턴이 interval만큼 늘었거나, 누적 이력
     문자수가 threshold만큼 늘었을 때. 그래서 임계값을 넘긴 뒤에도 매 턴 재실행되지 않는다.
@@ -500,7 +689,7 @@ async def _maybe_autosummarize(state, conv: dict, provider: dict) -> None:
             messages=msgs,
         )
         for fact in facts:
-            state.memory.add(fact, kind="fact", source_conversation_id=conv["id"])
+            memory.add(fact, kind="fact", source_conversation_id=conv["id"])
         if facts:
             print(f"[정보] 자동요약: 사실 {len(facts)}건 저장 (대화 {conv['id']})")
     except Exception as e:  # noqa: BLE001
@@ -509,7 +698,7 @@ async def _maybe_autosummarize(state, conv: dict, provider: dict) -> None:
         # 성공/실패와 무관하게 이번 시점을 기록해 다음 트리거까지 재실행을 막는다.
         conv["memory_summarized_turn"] = turns
         conv["memory_summarized_chars"] = chars
-        state.store.save(conv)
+        store.save(conv)
 
 
 def _require_local(request: Request) -> None:

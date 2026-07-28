@@ -63,6 +63,16 @@ try:
 except ImportError:
     pythoncom = None  # type: ignore[assignment]
 
+# PDF 추출은 pdf_server의 검증된 저하 체인(direct→word_com→reader_print)을 재사용한다.
+# 선택 의존성 — 못 불러와도 다른 형식(Word/PPT) 인덱싱은 계속된다(우아한 저하).
+try:
+    from pdf_server import _extract as _pdf_extract
+
+    PDF_IMPORT_ERROR = ""
+except Exception as e:  # noqa: BLE001 — pypdf/pywin32 부재 등 어떤 실패든 저하로
+    _pdf_extract = None  # type: ignore[assignment]
+    PDF_IMPORT_ERROR = str(e)
+
 try:
     import numpy as _np  # 선택 의존성 — 없으면 순수 파이썬 코사인으로 저하
 except ImportError:
@@ -98,7 +108,11 @@ CHUNK_SIZE = 1000      # 청크 목표 길이(문자)
 CHUNK_OVERLAP = 200    # 청크 사이 겹침(문자)
 EMBED_BATCH = 16       # 임베딩 요청 한 번에 보낼 청크 수
 EMBED_TIMEOUT = 120    # 임베딩 요청 타임아웃(초) — CPU 서빙이면 배치가 느릴 수 있다
-DOC_PATTERNS = (".docx", ".doc")  # 인덱싱 대상 확장자
+# 인덱싱 대상 확장자 — 형식별로 추출 경로가 다르다(_extract_text가 분기).
+WORD_PATTERNS = (".docx", ".doc")          # Word COM
+PPT_PATTERNS = (".pptx", ".ppt")           # PowerPoint COM
+PDF_PATTERNS = (".pdf",)                    # pdf_server 추출 체인
+DOC_PATTERNS = WORD_PATTERNS + PPT_PATTERNS + PDF_PATTERNS
 MAX_RESULT_CHARS = 1200           # 검색 결과에서 청크 하나당 보여줄 최대 길이
 RRF_K = 60                        # RRF 상수 (관례값)
 
@@ -179,6 +193,123 @@ def _extract_word_text(path: str, password: str = "") -> str:
     with _document("word", path, password) as doc:
         raw = doc.Content.Text
     return _clean_word_text(raw or "")
+
+
+# ─────────────────────────────── PowerPoint 읽기 (COM) ───────────────────────────────
+
+
+def _ppt_shape_text(shape) -> str:
+    """도형 하나에서 텍스트를 뽑는다 — 텍스트 프레임·표·그룹(재귀)까지.
+
+    COM은 도형 종류마다 지원 속성이 달라, 한 도형에서 실패해도 예외를 삼키고
+    다음 도형으로 넘어간다(한 슬라이드가 통째로 날아가지 않게).
+    """
+    out: list[str] = []
+    try:
+        if shape.HasTextFrame and shape.TextFrame.HasText:
+            out.append(shape.TextFrame.TextRange.Text or "")
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        if shape.HasTable:
+            table = shape.Table
+            for r in range(1, table.Rows.Count + 1):
+                cells = []
+                for c in range(1, table.Columns.Count + 1):
+                    try:
+                        cells.append((table.Cell(r, c).Shape.TextFrame.TextRange.Text or "").strip())
+                    except Exception:  # noqa: BLE001
+                        cells.append("")
+                out.append("\t".join(cells))
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        if shape.Type == 6:  # msoGroup — 그룹 안 도형을 재귀로 훑는다
+            for j in range(1, shape.GroupItems.Count + 1):
+                sub = _ppt_shape_text(shape.GroupItems.Item(j))
+                if sub:
+                    out.append(sub)
+    except Exception:  # noqa: BLE001
+        pass
+    return "\n".join(p for p in out if p and p.strip())
+
+
+def _ppt_notes_text(slide) -> str:
+    """발표자 노트 텍스트(있으면). 노트 페이지엔 슬라이드 이미지·페이지번호 자리표시자도
+    섞여 있으므로 '본문(body)' 자리표시자만 골라 읽는다(안 그러면 페이지 번호가 딸려온다)."""
+    try:
+        parts = []
+        for shape in slide.NotesPage.Shapes:
+            try:
+                if shape.PlaceholderFormat.Type != 2:  # 2 = ppPlaceholderBody (노트 본문)
+                    continue
+            except Exception:  # noqa: BLE001 — 자리표시자가 아닌 도형이면 건너뜀
+                continue
+            try:
+                if shape.HasTextFrame and shape.TextFrame.HasText:
+                    parts.append(shape.TextFrame.TextRange.Text or "")
+            except Exception:  # noqa: BLE001
+                pass
+        return _clean_word_text("\n".join(parts)).strip()
+    except Exception:  # noqa: BLE001
+        return ""
+
+
+def _extract_ppt_text(path: str, password: str = "") -> str:
+    """PowerPoint 슬라이드 텍스트를 순서대로 뽑는다 (제목·본문·표·발표자 노트).
+
+    슬라이드마다 '슬라이드 N' 머리말을 붙여 검색 결과에서 몇 번째 슬라이드인지
+    드러나게 한다. office COM(_document 'ppt')을 재사용하므로 Word와 같은 제약
+    (사용자 세션, Windows+Office)을 물려받는다.
+    """
+    _require_word()  # PPT도 office COM(_document)이 있어야 한다
+    parts: list[str] = []
+    with _document("ppt", path, password) as pres:
+        slides = pres.Slides
+        for i in range(1, slides.Count + 1):
+            slide = slides.Item(i)
+            lines = [f"슬라이드 {i}"]
+            for shape in slide.Shapes:
+                t = _ppt_shape_text(shape)
+                if t:
+                    lines.append(t)
+            note = _ppt_notes_text(slide)
+            if note:
+                lines.append(f"[발표자 노트] {note}")
+            if len(lines) > 1:  # 머리말만 있는 빈 슬라이드는 건너뜀
+                parts.append(_clean_word_text("\n".join(lines)))
+    return _nfc("\n\n".join(parts))
+
+
+# ─────────────────────────────── PDF 읽기 (pdf_server 재사용) ───────────────────────────────
+
+
+def _extract_pdf_text(path: str, password: str = "") -> str:
+    """PDF 텍스트를 뽑는다 — pdf_server의 저하 체인(direct→word_com→reader_print).
+
+    DRM PDF는 word_com 경로로 읽힌다(인증 앱 통과 원리). pdf_server를 못 불러왔거나
+    모든 백엔드가 실패하면 RagError를 던져 해당 파일만 실패로 집계되게 한다.
+    (password는 현재 pdf_server 추출 체인이 받지 않아 무시된다 — 시그니처만 맞춘다.)
+    """
+    if _pdf_extract is None:
+        raise RagError(f"PDF 추출 모듈(pdf_server)을 불러오지 못했습니다: {PDF_IMPORT_ERROR}")
+    text, _backend, reasons = _pdf_extract(path, "")
+    if not text:
+        detail = "; ".join(reasons) if reasons else "사유 없음"
+        raise RagError(f"PDF 텍스트를 추출하지 못했습니다({detail})")
+    return _nfc(text)
+
+
+def _extract_text(path: str, password: str = "") -> str:
+    """확장자에 맞는 추출기로 문서 본문 텍스트를 뽑는다 (인덱서 공용 진입점)."""
+    ext = os.path.splitext(path)[1].lower()
+    if ext in WORD_PATTERNS:
+        return _extract_word_text(path, password)
+    if ext in PPT_PATTERNS:
+        return _extract_ppt_text(path, password)
+    if ext in PDF_PATTERNS:
+        return _extract_pdf_text(path, password)
+    raise RagError(f"지원하지 않는 파일 형식입니다: {ext}")
 
 
 # ─────────────────────────────── 청킹 ───────────────────────────────
@@ -318,9 +449,28 @@ def _normalize(vec: list[float]) -> list[float]:
     return [v / n for v in vec] if n > 0 else vec
 
 
-def _embed_texts(texts: list[str]) -> list[list[float]] | None:
+_embed_warned = False  # 임베딩 실패 원인을 stderr에 한 번만 알리기 위한 플래그
+
+
+def _warn_embed_failure(detail: str) -> None:
+    """임베딩 요청이 처음 실패한 시점에 원인을 stderr에 한 번만 남긴다.
+
+    조용히 키워드 전용으로 저하하면(우아한 저하) 배포 환경에서 "왜 벡터가 0개인지"를
+    알 수 없다. 흔한 원인은 청크가 물리 배치(-ub)를 넘겨 서버가 내는 500 에러다.
+    """
+    global _embed_warned
+    if _embed_warned:
+        return
+    _embed_warned = True
+    print(f"[임베딩] 요청 실패 — 이번 실행은 키워드 전용으로 저하됩니다. 원인: {detail}",
+          file=sys.stderr)
+
+
+def _embed_texts(texts: list[str], warn: bool = False) -> list[list[float]] | None:
     """임베딩 서버에 배치 요청. 어떤 실패든 None을 돌려 키워드 전용으로 저하한다.
 
+    warn=True면 첫 실패 원인을 stderr에 한 번 남긴다(인덱싱 경로 전용 — 준비 대기 중의
+    ping 실패까지 시끄럽게 알리지 않도록 기본은 조용).
     반환 벡터는 단위 길이로 정규화한다 (검색 때 내적 = 코사인 유사도).
     """
     if not texts:
@@ -333,11 +483,24 @@ def _embed_texts(texts: list[str]) -> list[list[float]] | None:
     try:
         with urllib.request.urlopen(req, timeout=EMBED_TIMEOUT) as resp:
             data = json.loads(resp.read().decode("utf-8"))
-    except (urllib.error.URLError, TimeoutError, json.JSONDecodeError, OSError):
+    except urllib.error.HTTPError as e:
+        detail = ""
+        try:
+            detail = e.read().decode("utf-8", "replace")[:300]
+        except Exception:  # noqa: BLE001
+            pass
+        if warn:
+            _warn_embed_failure(f"HTTP {e.code} {detail}".strip())
+        return None
+    except (urllib.error.URLError, TimeoutError, json.JSONDecodeError, OSError) as e:
+        if warn:
+            _warn_embed_failure(f"{type(e).__name__}: {e}")
         return None
     items = sorted(data.get("data") or [], key=lambda d: d.get("index", 0))
     vecs = [it.get("embedding") for it in items]
     if len(vecs) != len(texts) or any(not isinstance(v, list) or not v for v in vecs):
+        if warn:
+            _warn_embed_failure(f"응답 형식 불일치 (요청 {len(texts)}개, 벡터 {len(vecs)}개)")
         return None
     return [_normalize([float(x) for x in v]) for v in vecs]
 
@@ -503,6 +666,15 @@ class _QdrantVectors:
         except Exception:  # noqa: BLE001 — 컬렉션이 없으면 그만
             pass
 
+    def close(self) -> None:
+        # 인터프리터 종료 전에 명시적으로 닫는다. Qdrant 로컬 클라이언트는 __del__에서
+        # 뒤늦게 close()를 부르는데, 그게 종료 중에 실행되면 import 시스템이 이미 내려가
+        # "ImportError: sys.meta_path is None" 잡음이 stderr로 튄다. 살아 있을 때 닫아 막는다.
+        try:
+            self.client.close()
+        except Exception:  # noqa: BLE001 — 이미 닫혔거나 버전에 close가 없으면 무시
+            pass
+
 
 class RagStore:
     """인덱스 sqlite 파일 하나(+ 선택적 Qdrant 벡터 폴더)를 관리한다. 스레드 안전."""
@@ -530,6 +702,16 @@ class RagStore:
     @property
     def vec_kind(self) -> str:
         return "qdrant" if self.vec is not None else "sqlite"
+
+    def close(self) -> None:
+        """Qdrant 클라이언트와 sqlite 연결을 명시적으로 닫는다(종료 잡음 방지)."""
+        with self._lock:
+            if self.vec is not None:
+                self.vec.close()
+            try:
+                self.conn.close()
+            except Exception:  # noqa: BLE001
+                pass
 
     def _init_schema(self) -> None:
         with self._lock:
@@ -814,6 +996,15 @@ def get_store() -> RagStore:
         if _store is None or _store.path != DB_PATH or _store.qdrant_path != QDRANT_PATH:
             _store = RagStore(DB_PATH, QDRANT_PATH)
         return _store
+
+
+def close_store() -> None:
+    """전역 store를 명시적으로 닫는다(CLI 종료 시 Qdrant __del__ 잡음 방지). 서버는 상주라 불필요."""
+    global _store
+    with _store_lock:
+        if _store is not None:
+            _store.close()
+            _store = None
 
 
 # ─────────────────────────────── 상태 요약 (양쪽 공용) ───────────────────────────────
