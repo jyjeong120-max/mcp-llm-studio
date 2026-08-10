@@ -9,6 +9,7 @@ const taskModeBtn = $("taskModeBtn");
 
 let currentConvId = null;
 let currentProjectId = null;   // 활성 프로젝트 (null = "기본" 공간). 대화·메모리·프롬프트 격리 기준.
+let projectNames = {};   // { id: name } — 새 대화 화면의 활성 공간 배지에 쓴다(loadProjects가 갱신).
 let attachments = [];   // {id, name, chars}
 let sending = false;
 let abortController = null;
@@ -269,6 +270,21 @@ function enhanceContent(root) {
   }
 }
 
+/* 카드(도구 결과·생각·단계) 본문에도 답변 말풍선과 같은 마크다운을 입힌다.
+   스트리밍으로 토큰이 붙는 카드는 el._mdRaw 에 원문을 누적해 매 토큰 다시 렌더하고
+   (답변 본문과 같은 방식 — line 902), 완료 시 enhanceContent 로 코드 하이라이트·
+   수식을 한 번만 입힌다. md()/enhanceContent 는 라이브러리 미로드 시 평문으로 저하한다. */
+function mdAppend(el, text) {
+  el._mdRaw = (el._mdRaw || "") + text;
+  el.innerHTML = md(el._mdRaw);
+}
+
+function mdSet(el, text) {
+  el._mdRaw = text || "";
+  el.innerHTML = md(el._mdRaw);
+  enhanceContent(el);
+}
+
 /* ==================== 메시지 렌더링 ==================== */
 
 function hideEmptyHint() {
@@ -335,9 +351,12 @@ function finishToolBlock(details, result, executed = true) {
       spinner.classList.add("tool-denied");
     }
   }
-  const pre = document.createElement("pre");
-  pre.textContent = result;
-  details.appendChild(pre);
+  // 도구 결과에도 마크다운을 입힌다 — office/excel 서버 등이 돌려주는 표·제목이
+  // 답변 본문처럼 렌더된다. (승인 카드의 인자 프리뷰는 JSON이라 그대로 <pre> 유지.)
+  const body = document.createElement("div");
+  body.className = "content tool-result";
+  mdSet(body, result);
+  details.appendChild(body);
 }
 
 /* 위험 도구 승인 카드 — 모델이 confirm 도구를 실행하려 할 때 서버가 멈추고
@@ -432,7 +451,7 @@ function addReasoningBlock(container) {
   const summary = document.createElement("summary");
   summary.innerHTML = '💭 <b>생각 과정</b> <span class="tool-spinner">진행 중</span>';
   const body = document.createElement("div");
-  body.className = "reasoning-body";
+  body.className = "reasoning-body content";  // content: 마크다운 요소 스타일 공유
   details.append(summary, body);
   container.insertBefore(details, container.firstChild);  // 답변보다 위에
   scrollBottom();
@@ -440,13 +459,14 @@ function addReasoningBlock(container) {
 }
 
 function appendReasoning(details, text) {
-  details.querySelector(".reasoning-body").textContent += text;
+  mdAppend(details.querySelector(".reasoning-body"), text);
   scrollBottom();
 }
 
 function finishReasoning(details) {
   const sp = details.querySelector(".tool-spinner");
   if (sp) { sp.classList.remove("tool-spinner"); sp.textContent = "완료"; }
+  enhanceContent(details.querySelector(".reasoning-body"));  // 코드·수식 마감 렌더
   details.open = false;   // 끝난 생각은 접어 답변에 집중
 }
 
@@ -472,9 +492,9 @@ function addStepBlock(container, index, text) {
   details.open = true;
   const summary = document.createElement("summary");
   summary.innerHTML = `▶ <b>단계 ${index + 1}</b> ${escapeHtml(text)} <span class="tool-spinner">진행 중</span>`;
-  const pre = document.createElement("pre");
-  pre.className = "step-body";
-  details.append(summary, pre);
+  const body = document.createElement("div");
+  body.className = "step-body content";  // content: 마크다운 요소 스타일 공유
+  details.append(summary, body);
   container.appendChild(details);
   scrollBottom();
   return details;
@@ -482,7 +502,7 @@ function addStepBlock(container, index, text) {
 
 function appendStepToken(details, text) {
   if (!details) return;
-  details.querySelector(".step-body").textContent += text;
+  mdAppend(details.querySelector(".step-body"), text);
   scrollBottom();
 }
 
@@ -494,6 +514,7 @@ function finishStepBlock(details, ok, result) {
     spinner.textContent = ok ? "완료" : "실패";
     spinner.classList.add("tool-spinner", ok ? "ok" : "fail");
   }
+  enhanceContent(details.querySelector(".step-body"));  // 코드·수식 마감 렌더
   details.open = false;   // 끝난 단계는 접어 답변에 집중
 }
 
@@ -591,12 +612,17 @@ function highlightLinks(flow, node, on) {
    끝난 앞 단계의 상태를 복원한다(재계획은 tail만 바뀌므로 앞 단계는 그대로 유지). */
 function buildCockpit(container, steps, meta, prevStatus) {
   const old = container.querySelector(".cockpit");
+  // 재계획/편집으로 코크핏을 다시 그려도 사람이 접어둔 상태는 유지한다.
+  const wasCollapsed = !!(old && old.classList.contains("collapsed"));
   if (old) old.remove();
   const panel = document.createElement("div");
   panel.className = "cockpit";
   const title = document.createElement("div");
   title.className = "cockpit-title";
-  title.innerHTML = "🧭 <b>실행 코크핏</b> <span class=\"hint\">계획 흐름 · 노드 클릭 시 결과</span>";
+  title.innerHTML = "<span class=\"caret\">▾</span>🧭 <b>실행 코크핏</b> " +
+    "<span class=\"hint\">제목 클릭 시 접기 · 노드 클릭 시 결과</span>";
+  title.title = "클릭하면 접거나 펼칩니다";
+  title.onclick = () => panel.classList.toggle("collapsed");
   const flow = document.createElement("div");
   flow.className = "flow";
   const nodes = [];
@@ -635,6 +661,7 @@ function buildCockpit(container, steps, meta, prevStatus) {
     nodes.push(node);
   });
   panel.append(title, flow);
+  if (wasCollapsed) panel.classList.add("collapsed");
   container.appendChild(panel);
   // 이미 끝난 앞 단계의 상태를 복원한다. 단, 재계획은 실패 지점부터 tail을 갈아끼우므로
   // '본문이 그대로인 노드'만 복원한다 — 자리(index)가 같아도 내용이 바뀐 새 단계에
@@ -669,11 +696,11 @@ function snapshotCockpit(nodes) {
   });
 }
 
-/* 조종 게이트 카드 (계획 확정 / 스텝 실패) — 승인 카드와 같은 방식으로 서버가 멈추고
+/* 조종 게이트 카드 (스텝 실패) — 승인 카드와 같은 방식으로 서버가 멈추고
    steer_request를 보내면, 결정을 POST /api/chat/steer 로 답한다. 서버는 그 결정에 따라
-   흐름을 이어간다(plan/step_start 이벤트가 뒤따른다). onResolved는 대기 상태 해제용. */
+   흐름을 이어간다(step_start 이벤트가 뒤따른다). onResolved는 대기 상태 해제용. */
 const STEER_LABELS = {
-  run: "✅ 계획대로 실행합니다", edit: "✏ 편집한 계획으로 진행합니다",
+  edit: "✏ 편집한 단계로 재시도합니다",
   abort: "🚫 작업을 중단했습니다", retry: "↻ 이 단계를 재시도합니다",
   skip: "⏭ 이 단계를 건너뜁니다", replan: "🧭 계획을 다시 세웁니다",
 };
@@ -710,37 +737,10 @@ function addSteerBlock(container, ev, onResolved) {
       div.querySelectorAll("button, textarea, input").forEach(b => b.disabled = false);
     }
   };
-  if (ev.phase === "plan") buildPlanGate(div, ev, decide);
-  else buildFailGate(div, ev, decide);
+  buildFailGate(div, ev, decide);
   container.appendChild(div);
   scrollBottom();
   return div;
-}
-
-// 계획 확정 게이트: 계획을 편집 가능한 텍스트로 보여주고 [실행](편집 시 자동 반영)·[취소].
-function buildPlanGate(div, ev, decide) {
-  const head = document.createElement("div");
-  head.className = "steer-head";
-  head.innerHTML = "🧭 <b>계획 확인</b> — 실행 전에 계획을 확인하거나 편집하세요 " +
-    '<span class="hint">(한 줄에 한 단계, [서버]·[←번호] 태그 유지)</span>';
-  const ta = document.createElement("textarea");
-  ta.className = "steer-plan";
-  ta.spellcheck = false;
-  const steps = ev.steps || [];
-  const original = steps.map((s, i) => `${i + 1}. ${s}`).join("\n");
-  ta.value = original;
-  ta.rows = Math.max(3, steps.length + 1);
-  const row = document.createElement("div");
-  row.className = "steer-btns";
-  const run = mkBtn("실행", "primary", () => {
-    const lines = ta.value.split("\n")
-      .map(l => l.replace(/^\s*\d+[.)]\s*/, "").trim())  // 앞머리 번호 제거
-      .filter(Boolean);
-    const edited = ta.value.trim() !== original.trim();
-    decide(edited ? { action: "edit", steps: lines } : { action: "run" });
-  });
-  row.append(run, mkBtn("취소", "danger", () => decide({ action: "abort" })));
-  div.append(head, ta, row);
 }
 
 // 스텝 실패 게이트: 실패한 단계와 결과를 보여주고 재시도/건너뛰기/재계획/편집/중단.
@@ -1204,11 +1204,18 @@ function newChat() {
   if (sending && abortController) abortController.abort();
   currentConvId = null;
   $("convTitle").textContent = "새 대화";
+  // 활성 공간 배지 — 이 새 대화가 "일반 대화"에 담길지 어떤 프로젝트에 담길지 미리 보여준다.
+  const space = currentProjectId
+    ? `📁 ${escapeHtml(projectNames[currentProjectId] || "프로젝트")}`
+    : "💬 일반 대화";
   messagesEl.innerHTML =
-    '<div id="emptyHint"><h2>무엇을 도와드릴까요?</h2><p>메시지를 입력하면 대화가 시작됩니다.</p></div>';
+    `<div id="emptyHint"><div class="space-badge">${space}</div>` +
+    "<h2>무엇을 도와드릴까요?</h2><p>메시지를 입력하면 대화가 시작됩니다.</p></div>";
   loadConversations();
 }
-$("newChatBtn").addEventListener("click", newChat);
+// 상단 버튼은 항상 "일반 대화"(기본 공간)로 새 대화를 연다 — 활성 프로젝트가 있어도 벗어난다.
+// 특정 프로젝트에서 시작하려면 그 프로젝트 폴더 헤더의 ＋ 버튼을 쓴다(makeProjectFolder).
+$("newChatBtn").addEventListener("click", () => { currentProjectId = null; newChat(); });
 
 /* ==================== 프로젝트 (프롬프트·기억 격리) ==================== */
 /* 사이드바는 인라인 아코디언 폴더 트리다: 프로젝트 폴더를 클릭하면 그 자리에서 펼쳐지며
@@ -1222,6 +1229,7 @@ async function loadProjects() {
   let projects = [];
   try { projects = await (await fetch("/api/projects")).json(); }
   catch (e) { projects = []; }
+  projectNames = Object.fromEntries(projects.map(p => [p.id, p.name]));
   // 활성/펼침 상태가 삭제된 프로젝트를 가리키면 정리한다.
   if (currentProjectId && !projects.some(p => p.id === currentProjectId)) currentProjectId = null;
   const ids = new Set(projects.map(p => p.id));
@@ -1261,12 +1269,22 @@ function makeProjectFolder(p) {
   const count = document.createElement("span");
   count.className = "folder-count";
   if (p.conversation_count) count.textContent = p.conversation_count;
+  const add = document.createElement("button");
+  add.className = "gear";
+  add.textContent = "＋";
+  add.title = "이 프로젝트에서 새 대화 시작";
+  add.addEventListener("click", (e) => {
+    e.stopPropagation();
+    currentProjectId = p.id;   // 활성 공간을 이 프로젝트로 바꾸고 빈 새 대화를 연다
+    expandedProjects.add(p.id);
+    newChat();                 // → loadConversations()로 사이드바가 이 프로젝트를 활성·펼침으로 다시 그린다
+  });
   const gear = document.createElement("button");
   gear.className = "gear";
   gear.textContent = "⚙";
   gear.title = "프로젝트 설정 (이름·프롬프트·기억)";
   gear.addEventListener("click", (e) => { e.stopPropagation(); openProjectSettings(p.id); });
-  head.append(caret, name, count, gear);
+  head.append(caret, name, count, add, gear);
 
   const kids = document.createElement("ul");
   kids.className = "folder-convs";
@@ -1464,6 +1482,47 @@ $("compactBtn").addEventListener("click", async () => {
   }
 });
 
+/* 대화 비우기(파괴적) — 현재 대화를 통째로 삭제하고 이 공간의 장기 기억을 모두 비운다.
+   압축이 "앞부분만 요약으로 줄이는" 것과 달리, 이건 대화·기억을 함께 초기화한다.
+   기억 비우기는 로컬 접속 전용(_require_local)이므로 원격에선 거절될 수 있다. */
+$("clearBtn").addEventListener("click", async () => {
+  if (sending) { showToast("응답 생성 중에는 비울 수 없습니다.", "warn"); return; }
+  const memScope = currentProjectId ? "이 프로젝트의 장기 기억" : "기본 공간의 장기 기억";
+  if (!confirm(
+    "이 대화를 삭제하고 " + memScope + "을 모두 비울까요?\n" +
+    "대화 내용과 기억이 함께 사라집니다 (되돌릴 수 없음).\n" +
+    "(다른 프로젝트·기본 공간의 기억은 그대로입니다.)"
+  )) return;
+  const btn = $("clearBtn");
+  const prev = btn.textContent;
+  btn.disabled = true; btn.textContent = "⏳";
+  try {
+    // 1) 현재 대화 삭제 (있을 때만)
+    if (currentConvId) {
+      const res = await fetch(`/api/conversations/${currentConvId}${projQuery()}`, { method: "DELETE" });
+      if (!res.ok) {
+        const r = await res.json().catch(() => ({}));
+        showToast(r.detail || "대화 삭제 실패", "bad");
+        return;
+      }
+    }
+    // 2) 이 공간의 장기 기억 비우기
+    const memRes = await fetch(`/api/memory${projQuery()}`, { method: "DELETE" });
+    const memResult = await memRes.json().catch(() => ({}));
+    if (!memRes.ok) {
+      showToast(memResult.detail || "기억 비우기 실패", "bad");
+      return;   // 대화는 이미 지워졌으니 UI는 아래 finally 뒤 새 대화로 정리된다
+    }
+    showToast(`대화를 삭제하고 기억 ${memResult.deleted}건을 비웠습니다.`);
+    refreshMemoryCount();
+    newChat();   // 성공 시에만 빈 새 대화 화면으로 되돌린다 (실패 시 현재 화면 유지)
+  } catch (e) {
+    showToast("비우는 중 오류가 발생했습니다.", "bad");
+  } finally {
+    btn.disabled = false; btn.textContent = prev;
+  }
+});
+
 /* ==================== 파일 첨부 (📁 OS 네이티브 대화상자) ==================== */
 /* 서버가 로컬에서 도는 점을 이용해 OS 기본 '열기' 대화상자를 띄우고, 고른 원본
    경로를 복사 없이 등록한다. office COM이 원본을 제자리에서 열어(복호화) 읽는다.
@@ -1634,6 +1693,19 @@ $("settingsTabs").addEventListener("click", (e) => {
   if (btn) switchSettingsTab(btn.dataset.tab);
 });
 
+/* 'LLM 연결' 탭 안의 서브탭(로컬 서버 ↔ 외부 API) 전환. 상위 탭과 마찬가지로
+   서브패널은 모두 DOM에 남기고 display만 토글한다(숨은 입력값을 collectSettings가 읽음). */
+function switchLlmSubtab(name) {
+  document.querySelectorAll("#llmSubtabs .subtab").forEach(b =>
+    b.classList.toggle("active", b.dataset.subtab === name));
+  document.querySelectorAll('[data-panel="llm"] .subtab-panel').forEach(p =>
+    p.classList.toggle("active", p.dataset.subpanel === name));
+}
+$("llmSubtabs").addEventListener("click", (e) => {
+  const btn = e.target.closest(".subtab");
+  if (btn) switchLlmSubtab(btn.dataset.subtab);
+});
+
 /* 완료 안내 토스트 — 저장·서빙 시작·MCP 재연결 등 성공 동작 뒤에 잠깐 띄운다.
    kind: "ok"(기본)·"warn"·"bad". 상세/오류는 여전히 settingsMsg에 남는다. */
 let toastTimer = null;
@@ -1757,15 +1829,81 @@ function serializeMcpConfig() {
   return JSON.stringify({ mcpServers }, null, 2);
 }
 
+let _lastMcpStatus = null;   // 토글 실패 시 서버 진실값으로 UI를 되돌리기 위한 캐시
+
 function renderMcpStatus(status) {
+  _lastMcpStatus = status;
   const el = $("mcpStatus");
   const entries = Object.entries(status);
-  el.innerHTML = entries.length
-    ? entries.map(([name, s]) => s.connected
-        ? `<div><span class="ok">●</span> ${escapeHtml(name)} — 도구 ${s.tools.length}개: ${escapeHtml(s.tools.join(", "))}</div>`
-        : `<div><span class="bad">●</span> ${escapeHtml(name)} — ${escapeHtml(s.error || "연결 안 됨")}</div>`
-      ).join("")
-    : "<div>등록된 MCP 서버가 없습니다.</div>";
+  const builtins = entries.filter(([, s]) => s.builtin);
+  const externals = entries.filter(([, s]) => !s.builtin);
+  el.innerHTML = "";
+
+  // 내장 도구 — 설정 없이 앱에 들어있는 서버들. 체크박스로 켜고 끈다(즉시 재적재).
+  if (builtins.length) {
+    const box = document.createElement("div");
+    box.className = "builtin-block";
+    box.innerHTML = '<div class="builtin-title">내장 도구 <span class="hint">(설정 없이 바로 사용 — 켜고 끄기)</span></div>';
+    for (const [name, s] of builtins) {
+      const row = document.createElement("label");
+      row.className = "builtin-row";
+      const cb = document.createElement("input");
+      cb.type = "checkbox";
+      cb.checked = s.enabled !== false;
+      cb.addEventListener("change", () => toggleBuiltin(name, cb.checked, cb));
+      const dot = s.enabled === false ? "" :
+        `<span class="${s.connected ? "ok" : "bad"}">●</span> `;
+      const detail = s.enabled === false
+        ? '<span class="hint">꺼짐</span>'
+        : (s.connected ? `도구 ${s.tools.length}개` : `<span class="hint">${escapeHtml(s.error || "로드 안 됨")}</span>`);
+      const label = document.createElement("span");
+      label.className = "builtin-label";
+      label.innerHTML = `${dot}<b>${escapeHtml(name)}</b>` +
+        (s.desc ? ` <span class="hint">${escapeHtml(s.desc)}</span>` : "") + ` — ${detail}`;
+      row.append(cb, label);
+      box.appendChild(row);
+    }
+    el.appendChild(box);
+  }
+
+  // 외부(mcp_servers.json) 서버.
+  const ext = document.createElement("div");
+  ext.className = "external-block";
+  if (externals.length) {
+    ext.innerHTML = externals.map(([name, s]) => s.connected
+      ? `<div><span class="ok">●</span> ${escapeHtml(name)} — 도구 ${s.tools.length}개: ${escapeHtml(s.tools.join(", "))}</div>`
+      : `<div><span class="bad">●</span> ${escapeHtml(name)} — ${escapeHtml(s.error || "연결 안 됨")}</div>`
+    ).join("");
+  } else if (!builtins.length) {
+    ext.innerHTML = "<div>등록된 MCP 서버가 없습니다.</div>";
+  }
+  el.appendChild(ext);
+}
+
+/* 내장 서버 켜고 끄기 — config.builtin_disabled를 갱신하고 MCP를 즉시 재적재한다. */
+async function toggleBuiltin(name, enabled, cb) {
+  cb.disabled = true;
+  try {
+    const res = await fetch("/api/mcp/builtin", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ name, enabled }),
+    });
+    const result = await res.json();
+    if (!res.ok) { showToast(result.detail || "변경 실패", "bad"); revertMcpStatus(cb, enabled); return; }
+    renderMcpStatus(result.status);
+    showToast(`내장 '${name}' ${enabled ? "켬" : "끔"}`, "ok");
+  } catch (e) {
+    showToast("내장 도구 변경 오류", "bad"); revertMcpStatus(cb, enabled);
+  } finally {
+    cb.disabled = false;
+  }
+}
+
+/* 토글 실패 시 UI를 서버 상태로 되돌린다. 서버는 변경되지 않았으므로 마지막으로 렌더한
+   상태를 다시 그리면 체크박스·연결 점이 모두 일관되게 복구된다(캐시 없으면 체크박스만 되돌림). */
+function revertMcpStatus(cb, enabled) {
+  if (_lastMcpStatus) renderMcpStatus(_lastMcpStatus);
+  else cb.checked = !enabled;
 }
 
 /* MCP 서버 편집기 — 주소/명령을 폼으로 입력한다(JSON 직접 편집 대신) */

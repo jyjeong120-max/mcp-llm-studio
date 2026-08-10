@@ -40,7 +40,7 @@ pywin32(COM)로 **이미 로그인·실행 중인** Office/Outlook을 직접 조
 - **우아한 저하** — pywin32가 없으면(`COM_AVAILABLE=False`) 서버는 정상적으로 뜨고 모든 도구가 실패 사유를 담은 안내 메시지를 반환한다. import 에러로 죽지 않는다.
 - `path=""` → 지금 활성화된 문서, `path` 지정 → 열려 있으면 그 세션, 아니면 백그라운드에서 읽기 전용으로 열었다 닫는다. 암호 걸린 문서는 `password` 인자로 넘긴다 (대화상자 대신 오류 메시지로 물러선다).
 
-`office_server.py`는 Word/PowerPoint **읽기 전용** + Excel 쓰기(3티어)다: 🟢 읽기(read_* 등 18개) / 🟡 메모리 수정(`write_excel_cell`·`write_excel_range` — **사용자 세션에 열려 있는** 통합문서만, 저장 안 함. COM 수정은 Excel Ctrl+Z에 안 쌓여서 이전 값을 응답으로 돌려준다) / 🔴 디스크 기록(`save_workbook` — confirm 게이트). 쓰기 도구는 백그라운드 읽기 전용 인스턴스(`_document`)를 쓰지 않고 `_writable_workbook`으로 열린 문서만 잡는다 — 이 구분을 깨지 말 것.
+`office_server.py`는 Word·Excel·PowerPoint **셋 다 읽기+쓰기(3티어)**다: 🟢 읽기(read_*/describe_*/find_*/inspect_* — Word는 특정 섹션만 읽는 `read_word_section`, PPT는 도형 번호·크기를 확인하는 `list_slide_shapes`·`get_shape_size` 포함) / 🟡 메모리 수정(Excel `write_excel_cell`·`write_excel_range`, Word `replace_in_word`·`insert_word_text`, PowerPoint `set_powerpoint_text`·`replace_in_powerpoint`·`set_shape_size`·`set_shape_position`·`format_shape`·`add_text_box`·`add_shape`·`add_slide`·`delete_shape` — **사용자 세션에 열려 있는** 문서만, 저장 안 함. Excel COM 수정은 Ctrl+Z에 안 쌓여 이전 값을 응답으로 돌려주고, Word/PPT는 저장 전이라 Ctrl+Z/'저장 없이 닫기'로 되돌린다) / 🔴 디스크 기록(Excel `save_workbook`·Word `save_document`·PPT `save_presentation` — confirm 게이트). 쓰기 도구는 백그라운드 읽기 전용 인스턴스(`_document`)를 쓰지 않고 `_writable_workbook`/`_writable_document`/`_writable_presentation`으로 사용자 세션에 열린 문서만 잡는다 — 이 구분을 깨지 말 것. PPT 도형은 번호(1-based) 또는 이름으로 지정하고(`_resolve_shape`), 좌표·크기는 PowerPoint COM의 포인트(pt) 단위에 `unit`으로 cm/mm/in도 받는다(`_to_points`).
 
 `outlook_server.py`는 쓰기가 가능해서 **3티어 안전 등급**을 따른다:
 - 🟢 읽기 — 목록/검색/상세/첨부 저장/일정·연락처·작업 조회

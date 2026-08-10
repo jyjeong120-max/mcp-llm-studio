@@ -66,8 +66,6 @@ import os
 import subprocess
 import sys
 import tempfile
-import threading
-import time
 from functools import wraps
 
 from fastmcp import FastMCP
@@ -89,14 +87,16 @@ except Exception as e:  # noqa: BLE001 — 하위 의존성 실패 포함
 # import하면 그쪽 FastMCP 인스턴스와 전체 도구가 부작용으로 딸려오고, office import가
 # 실패하면 여기 Word 백엔드까지 죽는다. ansys_server처럼 자체 스텁으로 독립시킨다.
 try:
-    import pythoncom
-    import win32com.client
+    import pythoncom  # pdf_tool 데코레이터의 스레드별 CoInitialize에 쓴다
 
     COM_AVAILABLE = True
     COM_IMPORT_ERROR = ""
 except ImportError as e:  # Windows가 아니거나 pywin32 미설치
     COM_AVAILABLE = False
     COM_IMPORT_ERROR = str(e)
+
+# Word COM 추출은 공용 헬퍼로 뺐다(text_server와 공유, 중복 0). 순수 헬퍼라 서버 부작용 없음.
+from word_extract import extract_via_word  # noqa: E402
 
 mcp = FastMCP(
     name="pdf",
@@ -199,19 +199,6 @@ def _resolve_pages(spec: str, n_pages: int) -> list[int]:
     return out
 
 
-def _clean_word_text(raw: str) -> str:
-    """Word Content.Text의 제어문자를 사람이 읽을 수 있게 정리한다.
-
-    Word는 단락을 \\r, 페이지 나눔을 \\x0c, 셀/특수 끝표시를 \\x07 등으로 표현한다.
-    """
-    if not raw:
-        return ""
-    text = raw.replace("\r\n", "\n").replace("\r", "\n").replace("\x0c", "\n\n")
-    # 표 셀 끝표시(\x07)와 기타 제어문자 제거 (줄바꿈/탭은 남긴다)
-    text = "".join(ch for ch in text if ch >= " " or ch in "\n\t")
-    return text.strip()
-
-
 def _truncate(text: str, limit: int) -> str:
     text = text or ""
     if limit <= 0 or len(text) <= limit:
@@ -260,181 +247,6 @@ def _extract_direct(path: str, pages: str, reasons: list[str]) -> str | None:
     except Exception as e:  # noqa: BLE001
         reasons.append(f"direct: pypdf 추출 실패({type(e).__name__}: {e})")
         return None
-
-
-def _winword_pids() -> set[int]:
-    """지금 실행 중인 WINWORD.EXE 프로세스 ID 집합. (psutil 없이 ctypes/psapi)
-
-    우리가 백그라운드로 띄운 Word만 골라 종료하기 위해, 생성 전후의 차집합을 쓴다.
-    """
-    try:
-        import ctypes
-        from ctypes import wintypes
-    except Exception:  # noqa: BLE001 — Windows가 아니면 여기 올 일이 없다
-        return set()
-    try:
-        psapi = ctypes.WinDLL("Psapi.dll")
-        kernel = ctypes.WinDLL("kernel32.dll")
-        # 64비트에서 핸들이 잘리지 않도록 반환/인자 타입을 명시한다.
-        kernel.OpenProcess.restype = wintypes.HANDLE
-        kernel.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
-        kernel.CloseHandle.argtypes = [wintypes.HANDLE]
-        psapi.GetModuleBaseNameW.argtypes = [
-            wintypes.HANDLE, wintypes.HMODULE, wintypes.LPWSTR, wintypes.DWORD,
-        ]
-        arr = (wintypes.DWORD * 4096)()
-        needed = wintypes.DWORD()
-        if not psapi.EnumProcesses(ctypes.byref(arr), ctypes.sizeof(arr), ctypes.byref(needed)):
-            return set()
-        count = needed.value // ctypes.sizeof(wintypes.DWORD)
-        pids: set[int] = set()
-        # GetModuleBaseNameW는 PROCESS_VM_READ가 필요하다(LIMITED 핸들로는 실패).
-        PROCESS_QUERY_INFORMATION = 0x0400
-        PROCESS_VM_READ = 0x0010
-        for i in range(count):
-            pid = int(arr[i])
-            if pid == 0:
-                continue
-            h = kernel.OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, False, pid)
-            if not h:
-                continue
-            try:
-                buf = ctypes.create_unicode_buffer(260)
-                if psapi.GetModuleBaseNameW(h, None, buf, 260) and buf.value.upper() == "WINWORD.EXE":
-                    pids.add(pid)
-            finally:
-                kernel.CloseHandle(h)
-        return pids
-    except Exception:  # noqa: BLE001
-        return set()
-
-
-def _kill_pids(pids: set[int]) -> None:
-    """지정 PID들을 강제 종료한다(우리가 띄운 Word 정리용). 사용자 문서는 대상이 아니다."""
-    for pid in pids:
-        try:
-            subprocess.run(["taskkill", "/PID", str(pid), "/F", "/T"],
-                           capture_output=True, timeout=10)
-        except Exception:  # noqa: BLE001
-            pass
-
-
-def _dismiss_word_dialogs(pids: set[int]) -> None:
-    """지정 Word PID가 띄운 모달 대화상자(예: 'PDF를 편집 가능한 문서로 변환')를
-    자동으로 확인(기본 버튼/Enter)해 Open이 진행되도록 한다. best-effort — 실패해도 무해."""
-    if not pids:
-        return
-    try:
-        import win32api
-        import win32con
-        import win32gui
-        import win32process
-    except Exception:  # noqa: BLE001 — pywin32 UI 모듈이 없으면 그냥 건너뛴다(타임아웃이 처리)
-        return
-
-    def _cb(hwnd, _):
-        try:
-            _, wpid = win32process.GetWindowThreadProcessId(hwnd)
-            if wpid in pids and win32gui.GetClassName(hwnd) in ("#32770", "NUIDialog"):
-                try:
-                    win32gui.SetForegroundWindow(hwnd)
-                except Exception:  # noqa: BLE001
-                    pass
-                # 기본 버튼(OK/확인) 실행: WM_COMMAND IDOK 와 Enter 키 둘 다 시도
-                win32gui.PostMessage(hwnd, win32con.WM_COMMAND, win32con.IDOK, 0)
-                win32api.keybd_event(0x0D, 0, 0, 0)
-                win32api.keybd_event(0x0D, 0, win32con.KEYEVENTF_KEYUP, 0)
-        except Exception:  # noqa: BLE001
-            pass
-        return True
-
-    try:
-        win32gui.EnumWindows(_cb, None)
-    except Exception:  # noqa: BLE001
-        pass
-
-
-def _extract_word(path: str, reasons: list[str]) -> str | None:
-    """Word를 백그라운드로 띄워 PDF를 열고(자동 변환) 본문 텍스트를 뽑는다.
-
-    Word가 DRM 인증 앱이면 복호화된 내용이 읽힌다. office_server._open_background의
-    Word 열기 방식을 차용했다. pages는 지원하지 않는다(Word 변환 결과는 원본 페이지
-    경계와 어긋난다 — 전체 본문을 돌려준다).
-
-    ⚠ Word의 'PDF를 편집 가능한 문서로 변환' 확인창은 DisplayAlerts=0으로 억제되지
-    않아 백그라운드 인스턴스를 무한 대기시킬 수 있다(개발 PC에서 재현됨). 그래서:
-      1) Open을 데몬 스레드에서 돌리고 하드 타임아웃(WORD_TIMEOUT)으로 기다린다.
-      2) 그 사이 워치독이 변환 대화상자를 자동 확인해 Open을 풀어준다(best-effort).
-      3) 시간이 지나면 우리가 띄운 Word PID만 골라 강제 종료하고 물러선다.
-    이 덕에 대화상자에 걸려도 MCP 서버가 영영 얼지 않는다.
-    """
-    if not COM_AVAILABLE:
-        reasons.append(f"word_com: pywin32 없음({COM_IMPORT_ERROR})")
-        return None
-
-    before = _winword_pids()
-    result: dict[str, str] = {}
-
-    def _opener():
-        # 데몬 스레드 — 자체 아파트먼트에서 COM을 초기화하고, app도 이 스레드에서 만든다
-        # (COM 객체를 스레드 간에 넘기지 않는다). 메인 스레드는 PID/창만 다룬다.
-        pythoncom.CoInitialize()
-        app = None
-        doc = None
-        try:
-            app = win32com.client.DispatchEx("Word.Application")
-            app.Visible = False
-            app.DisplayAlerts = 0
-            # FileName, ConfirmConversions=False, ReadOnly=True, AddToRecentFiles=False
-            doc = app.Documents.Open(path, False, True, False)
-            result["text"] = _clean_word_text(doc.Content.Text or "")
-        except Exception as e:  # noqa: BLE001 — pythoncom.com_error 포함
-            result["err"] = f"{type(e).__name__}: {e}"
-        finally:
-            try:
-                if doc is not None:
-                    doc.Close(SaveChanges=0)
-            except Exception:
-                pass
-            try:
-                if app is not None:
-                    app.Quit()
-            except Exception:
-                pass
-            pythoncom.CoUninitialize()
-
-    th = threading.Thread(target=_opener, daemon=True)
-    th.start()
-
-    # 대기하면서 우리가 띄운 Word의 대화상자를 계속 닫아 준다.
-    ours: set[int] = set()
-    deadline = time.time() + WORD_TIMEOUT
-    while th.is_alive() and time.time() < deadline:
-        if not ours:
-            ours = _winword_pids() - before
-        _dismiss_word_dialogs(ours)
-        time.sleep(0.3)
-
-    if th.is_alive():
-        # 타임아웃 — 우리가 띄운 Word만 강제 종료(스레드는 데몬이라 함께 정리된다).
-        _kill_pids(_winword_pids() - before)
-        reasons.append(
-            f"word_com: {int(WORD_TIMEOUT)}초 내 완료되지 않아 중단했습니다"
-            "(Word의 PDF 변환 대화상자에 막혔을 수 있음 — 실기에서 --probe로 확인)."
-        )
-        return None
-
-    if "text" in result:
-        text = result["text"]
-        if text.strip():
-            return text
-        reasons.append("word_com: 열었으나 텍스트가 비어 있음(이미지 PDF일 수 있음)")
-        return None
-
-    # 오류로 끝난 경로 — 혹시 남은 우리 Word가 있으면 정리.
-    _kill_pids(_winword_pids() - before)
-    reasons.append(f"word_com: Word로 열지 못함({result.get('err', '알 수 없는 오류')})")
-    return None
 
 
 def _find_acrobat() -> str | None:
@@ -505,7 +317,7 @@ def _extract(path: str, pages: str) -> tuple[str | None, str, list[str]]:
     reasons: list[str] = []
     for name, fn in (
         ("direct", lambda: _extract_direct(path, pages, reasons)),
-        ("word_com", lambda: _extract_word(path, reasons)),
+        ("word_com", lambda: extract_via_word(path, reasons, WORD_TIMEOUT)),
         ("reader_print", lambda: _extract_reader_print(path, pages, reasons)),
     ):
         text = fn()
@@ -587,7 +399,7 @@ def read_pdf_metadata(path: str) -> str:
             pass  # DRM 등 — 아래 Word 경로로 폴백
     # DRM 등 pypdf가 못 읽는 경우: Word로 열어 페이지 수/문서 속성을 확인한다.
     reasons: list[str] = []
-    text = _extract_word(p, reasons)
+    text = extract_via_word(p, reasons, WORD_TIMEOUT)
     if text:
         # Word 변환본에서 대략적인 정보만 제공 (정확한 원본 페이지 수는 알기 어렵다).
         approx = len(text)

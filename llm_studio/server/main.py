@@ -114,6 +114,11 @@ class MCPConfigRequest(BaseModel):
     content: str
 
 
+class BuiltinToggleRequest(BaseModel):
+    name: str        # 내장 서버 이름 (office/outlook/pdf/text)
+    enabled: bool    # True=켬, False=끔
+
+
 def create_app(state) -> FastAPI:
     """state: app.py가 조립한 AppState (config, llama, mcp, store, uploads...)."""
 
@@ -239,7 +244,6 @@ def create_app(state) -> FastAPI:
                 max_steps=int(state.config.get("task_max_steps", 10)),
                 max_replans=int(state.config.get("task_max_replans", 2)),
                 approver=approvals, steerer=steering,
-                plan_gate=state.config.get("task_plan_gate", False),
                 failure_gate=state.config.get("task_failure_gate", True),
                 branch_enabled=state.config.get("task_branch_enabled", True),
                 steer_timeout=float(state.config.get("task_steer_timeout", 600)),
@@ -538,6 +542,28 @@ def create_app(state) -> FastAPI:
         await state.mcp.reload()
         return {"ok": True, "status": state.mcp.status()}
 
+    @app.post("/api/mcp/builtin")
+    async def toggle_builtin(req: BuiltinToggleRequest):
+        """내장 MCP 서버(office/outlook/pdf/text)를 켜고 끈다.
+
+        config.builtin_disabled 목록을 갱신·저장하고 해당 내장 서버 워커만 붙였다 뗀다
+        (set_builtin). 다른 내장·외부(mcp_servers.json) 서버 연결은 건드리지 않는다.
+        """
+        from .builtin_servers import BUILTIN_MODULES
+
+        valid = {name for name, _mod, _desc in BUILTIN_MODULES}
+        if req.name not in valid:
+            raise HTTPException(400, f"알 수 없는 내장 서버: {req.name} (가능: {sorted(valid)})")
+        disabled = set(state.config.get("builtin_disabled", []))
+        if req.enabled:
+            disabled.discard(req.name)
+        else:
+            disabled.add(req.name)
+        state.config["builtin_disabled"] = sorted(disabled)
+        save_config(state.data_dir, state.config)
+        await state.mcp.set_builtin(req.name, req.enabled)
+        return {"ok": True, "status": state.mcp.status()}
+
     # ---------- 로컬 모델 서빙 (선택·시작·중지·재시작) ----------
     # 서빙은 앱 시작과 분리돼 있다. 사용자가 UI에서 GGUF를 고르고 옵션을 정한 뒤
     # 시작/중지한다. 서버 파라미터(모델 경로·gpu_layers·ctx 등)는 프런트가 먼저
@@ -740,12 +766,14 @@ _EXT_TOOL_KEYWORDS = {
     ".xlsx": ("excel",), ".xls": ("excel",), ".xlsm": ("excel",), ".xlsb": ("excel",),
     ".pptx": ("powerpoint", "ppt"), ".ppt": ("powerpoint", "ppt"), ".pptm": ("powerpoint", "ppt"),
     ".docx": ("word",), ".doc": ("word",), ".docm": ("word",),
+    ".pdf": ("pdf",),   # pdf_server의 read_pdf_text 등 (DRM PDF는 이 도구가 유일한 경로)
 }
 # 카테고리별로 '첫 호출'에 좋은 개요/본문 도구를 우선한다(여럿이면 이걸 먼저 집는다).
 _PREFERRED_TOOLS = (
     "describe_excel", "read_excel_range",
     "read_word_document", "read_word_outline",
     "read_powerpoint_outline", "read_powerpoint_slides",
+    "read_pdf_text",
 )
 
 
@@ -792,15 +820,22 @@ def _with_attachments(state, message: str, attachment_ids: list[str]) -> str:
         name = meta["name"]
         if meta.get("mode") == "path":
             ext = os.path.splitext(name)[1].lower()
-            tool = _pick_read_tool(state, ext) if ext in OFFICE_COM_EXTENSIONS else ""
+            tool = _pick_read_tool(state, ext)
             if tool:
+                # 연결된 읽기 도구가 있으면 경로만 주고 도구로 읽게 한다(내용을 인라인하지 않음).
+                # 약한 모델이 그냥 넘기지 않도록 '먼저 호출하라'고 강하게 지시한다.
                 parts.append(
                     f"\n[첨부 파일: {name}]\n"
-                    f"이 파일은 직접 텍스트로 읽을 수 없다. 답을 시작하기 전에 반드시 아래 "
+                    f"이 파일의 내용은 여기 인라인돼 있지 않다. 답을 시작하기 전에 반드시 아래 "
                     f"도구를 먼저 호출해 내용을 가져와라. 절대 '읽을 수 없다'고 답하지 말 것.\n"
                     f'도구 이름: {tool}\n'
                     f'인자(JSON): {{"path": "{meta["path"]}"}}'
                 )
+            elif text.strip():
+                # 도구는 없지만 서버가 뽑아둔 폴백 텍스트가 있으면 인라인(우아한 저하 — 예: PDF).
+                if len(text) > ATTACH_MAX_CHARS:
+                    text = text[:ATTACH_MAX_CHARS] + "\n[이하 생략]"
+                parts.append(f"\n[첨부 파일: {name}]\n---\n{text}\n---")
             elif ext in OFFICE_COM_EXTENSIONS:
                 # office 문서인데 읽기 도구가 안 붙음 → 정직하게 안내
                 parts.append(
@@ -808,6 +843,14 @@ def _with_attachments(state, message: str, attachment_ids: list[str]) -> str:
                     f"이 파일({ext})을 읽으려면 office 문서 읽기 MCP 도구가 필요한데 지금 "
                     f"연결돼 있지 않다. 설정 → MCP 도구 서버에서 office 서버를 연결한 뒤 다시 "
                     f"시도하도록 사용자에게 안내하라.\n경로: {meta['path']}"
+                )
+            elif ext == ".pdf":
+                # PDF인데 pdf 읽기 도구도 없고 폴백 추출도 실패(예: DRM) → 정직하게 안내
+                parts.append(
+                    f"\n[첨부 파일: {name}]\n"
+                    f"이 PDF를 읽으려면 pdf 읽기 MCP 도구(pdf_server)가 필요한데 지금 연결돼 있지 "
+                    f"않고, 서버 추출도 실패했다(DRM 등). 설정 → MCP 도구 서버에서 pdf 서버를 "
+                    f"연결한 뒤 다시 시도하도록 사용자에게 안내하라.\n경로: {meta['path']}"
                 )
             else:
                 # 이미지·압축 등 문서 도구가 없는 형식

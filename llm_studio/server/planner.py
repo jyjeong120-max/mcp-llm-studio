@@ -596,7 +596,6 @@ async def run_task(
     max_replans: int = DEFAULT_MAX_REPLANS,
     approver=None,
     steerer=None,
-    plan_gate: bool = False,
     failure_gate: bool = False,
     branch_enabled: bool = True,
     steer_timeout: float = DEFAULT_STEER_TIMEOUT,
@@ -605,10 +604,10 @@ async def run_task(
 
     계획을 못 세우면(파싱 0개/오류) 일반 run_chat으로 우아하게 저하한다.
 
-    steerer/plan_gate/failure_gate: '실행 코크핏'의 조종 게이트. steerer(SteeringBroker)가
-    주어지고 plan_gate가 켜지면 계획 직후 멈춰 사람의 확정/편집/취소를 기다리고,
+    steerer/failure_gate: '실행 코크핏'의 조종 게이트. steerer(SteeringBroker)가 주어지고
     failure_gate가 켜지면 스텝 실패 시 재시도/건너뛰기/재계획/편집/중단을 묻는다.
     steerer가 없거나 게이트가 꺼져 있으면 기존과 똑같이 자동으로 흐른다(우아한 저하).
+    (계획 확정 게이트는 제거됨 — 계획을 세우면 항상 바로 실행한다.)
 
     branch_enabled: 조건 분기('[?→M]') 태그를 해석할지 여부. 끄면 분기 태그를 본문의
     일부로 두어 일반 스텝처럼 실행한다.
@@ -653,40 +652,6 @@ async def run_task(
 
     state = TaskState(goal=goal, plan=plan)
     yield _plan_event(state.plan)
-
-    # ---------- 계획 확정 게이트 (반자동) ----------
-    # 계획을 세운 직후 멈춰 사람이 확인/편집/취소하게 한다. 약한 모델은 계획이 자주
-    # 틀리므로 실행 전에 한 번 잡아 준다. 게이트가 꺼져 있거나 steerer가 없으면 건너뛴다.
-    if plan_gate and steerer is not None:
-        decision = None
-        async for ev in _steer(
-                steerer, {"type": "steer_request", "phase": "plan",
-                          "steps": [_step_display(s) for s in state.plan]},
-                steer_timeout):
-            if "__steer__" in ev:
-                decision = ev["__steer__"]
-            else:
-                yield ev
-        if decision:
-            action = decision.get("action")
-            if action == "abort":
-                msg = "사용자가 계획을 확인하고 작업을 취소했습니다."
-                yield {"type": "step_token", "index": -1, "text": f"\n[{msg}]\n"}
-                yield {"type": "done",
-                       "messages": list(messages) + [{"role": "assistant", "content": msg}]}
-                return
-            if action == "edit":
-                # 사람이 편집한 계획으로 교체한다. 각 줄에서 태그를 다시 떼어 재구성한다.
-                edited = decision.get("steps") or []
-                new_plan = []
-                for rs in edited[:max_steps]:
-                    s = _split_tags(str(rs), valid_servers, allow_branch=branch_enabled)
-                    if s.body:
-                        new_plan.append(s)
-                if new_plan:
-                    state.plan = new_plan
-                    yield _plan_event(state.plan, edited=True)
-        # decision is None(시간 초과/무응답) 또는 action=="run" → 그대로 진행
 
     # ---------- 실행 루프 ----------
     i = 0

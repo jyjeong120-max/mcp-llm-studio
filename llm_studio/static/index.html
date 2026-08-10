@@ -52,6 +52,7 @@
     <header id="chatHeader">
       <span id="convTitle">새 대화</span>
       <button id="compactBtn" class="btn icon" title="이 대화의 앞부분을 요약으로 압축해 컨텍스트를 줄입니다 (원본 메시지는 사라집니다)">🗜</button>
+      <button id="clearBtn" class="btn icon" title="이 대화를 삭제하고 이 공간의 장기 기억을 모두 비웁니다 (되돌릴 수 없습니다)">🧹</button>
       <select id="providerSelect" title="응답에 사용할 모델 (로컬 또는 외부 API)"></select>
     </header>
     <!-- 로컬 모델 미실행 시 뜨는 셋업 바 — 여기서 바로 모델을 골라 서빙을 시작한다.
@@ -169,8 +170,14 @@
             </section>
           </div>
 
-          <!-- 탭 2: LLM 연결 (로컬 서빙 + 외부 API) -->
+          <!-- 탭 2: LLM 연결 (로컬 서빙 + 외부 API) — 안에서 다시 가로 서브탭으로 나눈다.
+               두 서브패널 모두 DOM에 남고 display만 토글하므로 숨은 입력값도 collectSettings가 읽는다. -->
           <div class="tab-panel" data-panel="llm">
+            <nav id="llmSubtabs" class="subtabs">
+              <button class="subtab active" data-subtab="local">🖥 로컬 LLM 서버</button>
+              <button class="subtab" data-subtab="external">☁ 외부 LLM 연결</button>
+            </nav>
+            <div class="subtab-panel active" data-subpanel="local">
             <section>
               <h4>로컬 LLM 서버 <span class="hint">(모델을 골라 서빙을 시작/중지합니다)</span></h4>
               <div id="serveStatus" class="serve-status"></div>
@@ -213,6 +220,9 @@
                 <button id="restartBtn" class="btn">재시작</button>
               </div>
             </section>
+            </div><!-- /subpanel local -->
+
+            <div class="subtab-panel" data-subpanel="external">
             <section>
               <h4>외부 LLM 연결 <span class="hint">(OpenAI 호환 API — 키는 서버 config.json에만 저장, 브라우저에는 남지 않음)</span></h4>
               <div id="providerRows"></div>
@@ -227,6 +237,7 @@
               </div>
               <p class="hint">chat/completions 규격이면 무엇이든 등록 가능. 저장은 하단 [설정 저장] 버튼으로 함께 저장됩니다.</p>
             </section>
+            </div><!-- /subpanel external -->
           </div>
 
           <!-- 탭 3: MCP 도구 -->

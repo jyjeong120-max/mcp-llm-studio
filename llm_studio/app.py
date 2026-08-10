@@ -19,7 +19,7 @@ serve_llm.py 등으로 이미 떠 있는 서버에 붙거나(external). 후자�
 공유하고 앱을 껐다 켜도 모델이 유지된다.
 
 사용:
-    python app.py                    # 기본 (UI 포트 8080, 유휴 상태로 시작 — UI에서 모델 선택)
+    python app.py                    # 기본 (UI 포트 8095, 유휴 상태로 시작 — UI에서 모델 선택)
     python app.py --host 0.0.0.0     # 같은 망의 다른 PC에서 접속 허용
     python app.py --mock             # 모델 없이 UI 개발/시험 (목 응답)
     python app.py --no-browser
@@ -30,6 +30,7 @@ PyInstaller로 묶으면 이 파일이 exe의 진입점이 된다.
 from __future__ import annotations
 
 import argparse
+import os
 import sys
 import threading
 import time
@@ -63,7 +64,7 @@ def build_state(args) -> SimpleNamespace:
         data_dir=data_dir,
         config=config,
         llama=LlamaServer(data_dir),
-        mcp=MCPManager(mcp_config_path(data_dir)),
+        mcp=MCPManager(mcp_config_path(data_dir), config=config),
         store=store,
         memory=memory,
         projects=ProjectManager(data_dir, store, memory),
@@ -143,7 +144,12 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="LocalLLM Studio — 로컬 LLM 채팅 스튜디오")
     parser.add_argument("--host", default="127.0.0.1",
                         help="UI 바인딩 주소. 다른 PC에서 접속하려면 0.0.0.0 (기본 127.0.0.1)")
-    parser.add_argument("--port", type=int, default=8080, help="UI 포트 (기본 8080)")
+    # UI 포트 기본 8095. 8080은 사내 보안 에이전트(ApplicationWebServer 등)가 선점하는
+    # 경우가 있어 피했다. 다른 PC에서 이 포트마저 막히면 LLM_STUDIO_PORT 환경변수로 덮어쓴다
+    # (MCP 서버들의 *_MCP_PORT 방식과 동일). 우리 다른 포트(llama 8000, 임베딩 8001,
+    # 리랭커 8002, MCP 8087~8093)와도 겹치지 않는 값.
+    parser.add_argument("--port", type=int, default=int(os.getenv("LLM_STUDIO_PORT", "8095")),
+                        help="UI 포트 (기본 8095, 환경변수 LLM_STUDIO_PORT로도 지정)")
     parser.add_argument("--data-dir", default=None, help="데이터 폴더 직접 지정")
     parser.add_argument("--mock", action="store_true", help="모델 없이 UI만 실행")
     parser.add_argument("--no-browser", action="store_true", help="브라우저 자동 열기 끄기")

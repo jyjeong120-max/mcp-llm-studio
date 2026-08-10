@@ -33,6 +33,12 @@ PATH_EXTENSIONS = {
 # 추출이 실패하므로 이때만 COM 경로 읽기로 넘긴다.
 OFFICE_COM_EXTENSIONS = PATH_EXTENSIONS | {".docx", ".doc", ".docm"}
 
+# 항상 path(도구 우선) 모드로 다루되, 붙는 읽기 도구가 없을 때를 대비해 서버 추출 텍스트도
+# 함께 저장해 두는 포맷. PDF는 pdf_server의 read_pdf_text로 **모델이 골라 읽는 걸 우선**한다
+# (사내 DRM PDF는 그 도구가 유일한 경로). 도구가 없으면 pypdf로 뽑은 텍스트로 우아하게 저하.
+# → 첨부 시 텍스트를 통째로 대화에 인라인하지 않고 경로만 넘기는 게 기본 동작.
+TOOL_PREFERRED_EXTENSIONS = {".pdf"}
+
 
 class UploadStore:
     def __init__(self, base_dir: Path):
@@ -57,6 +63,10 @@ class UploadStore:
         if path_mode:
             # 텍스트로 못 뽑는(또는 DRM으로 못 뽑는) 포맷: 경로 모드. 내용은 모델이 도구로 읽는다.
             mode, text = "path", ""
+        elif ext in TOOL_PREFERRED_EXTENSIONS:
+            # PDF 등: 경로를 줘 모델이 도구로 읽게 하고(인라인 안 함), 도구가 없을 때 쓸
+            # 폴백 텍스트만 뽑아 둔다. path 모드라 _with_attachments가 도구 유무로 갈라 쓴다.
+            mode, text = "path", _fallback_text(safe_name, data)
         else:
             mode, text = "text", extract_text(safe_name, data)
         meta = {
@@ -101,7 +111,15 @@ class UploadStore:
         path_mode = ext in PATH_EXTENSIONS or (com_office and ext in OFFICE_COM_EXTENSIONS)
         if path_mode:
             mode, text = "path", ""
-        elif ext in TEXT_EXTENSIONS or ext in (".pdf", ".docx"):
+        elif ext in TOOL_PREFERRED_EXTENSIONS:
+            # PDF: 경로 우선(모델이 도구로 읽음, 인라인 안 함) + 도구 없을 때 쓸 폴백 텍스트.
+            # 읽기/추출이 실패해도 예외로 죽지 않고 경로만 남긴다.
+            try:
+                text = _fallback_text(p.name, p.read_bytes())
+            except Exception:  # noqa: BLE001 — 권한/손상/DRM 등
+                text = ""
+            mode = "path"
+        elif ext in TEXT_EXTENSIONS or ext == ".docx":
             # 서버가 뽑을 수 있는 형식: 원본을 읽어 텍스트로. 실패하면 경로 모드로 저하.
             try:
                 mode, text = "text", extract_text(p.name, p.read_bytes())
@@ -137,6 +155,13 @@ class UploadStore:
         text_path = self.dir / f"{safe}.txt"
         text = text_path.read_text(encoding="utf-8") if text_path.exists() else ""
         return meta, text
+
+
+def _fallback_text(filename: str, data: bytes) -> str:
+    """도구가 없을 때만 쓰는 폴백 텍스트. 추출이 실패하면(안내 '[...]' 문자열) 빈 문자열로
+    돌려, 오류 메시지가 실제 내용인 척 대화에 인라인되지 않게 한다."""
+    text = extract_text(filename, data)
+    return "" if text.startswith("[") else text
 
 
 def extract_text(filename: str, data: bytes) -> str:

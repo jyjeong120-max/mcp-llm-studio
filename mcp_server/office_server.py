@@ -1,6 +1,6 @@
 """office_server.py
 
-Word / Excel / PowerPoint 문서를 읽고, Excel은 셀 쓰기까지 지원하는 MCP 서버입니다.
+Word / Excel / PowerPoint 문서를 읽고, 셋 다 편집(쓰기)까지 지원하는 MCP 서버입니다.
 pywin32(COM)로 설치된 Office를 직접 구동하므로, 파일 경로뿐 아니라
 지금 화면에 열려 있는 문서(저장 전 편집 내용 포함)도 그대로 읽습니다.
 
@@ -10,15 +10,20 @@ streamable-http 서버들과 달리 별도 터미널에서 실행해 둘 필요�
 Windows + Office 설치가 전제입니다. 둘 중 하나라도 없으면 서버는 그대로 실행되고,
 각 도구가 실패 사유를 담은 안내 메시지를 반환합니다.
 
-Word/PowerPoint 도구는 모두 읽기 전용입니다. Excel에만 쓰기 도구가 있으며
+Word/Excel/PowerPoint 모두 읽기+쓰기 도구가 있습니다.
 outlook_server와 같은 3티어 안전 등급을 따릅니다:
-    🟢 읽기 — 모든 read_*/describe_*/find_*/inspect_* 도구 (문서를 변경하지 않음)
-    🟡 메모리 수정(저장 안 함) — write_excel_cell/write_excel_range. **사용자 세션에
-       열려 있는** 통합문서만 수정하고 디스크에는 쓰지 않는다(저장 전까지 파일 원본은
-       그대로). 주의: COM 수정은 Excel의 실행 취소(Ctrl+Z) 스택에 쌓이지 않으므로,
-       복구용으로 이전 값을 응답에 담아 돌려준다.
-    🔴 디스크 기록 — save_workbook(덮어쓰기 저장). confirm=True 없이는 실행되지
-       않고 무엇을 할지 프리뷰만 돌려준다(_preview — outlook/catia와 같은 게이트).
+    🟢 읽기 — 모든 read_*/describe_*/find_*/inspect_*/list_slide_shapes/get_shape_size
+       도구 (문서를 변경하지 않음)
+    🟡 메모리 수정(저장 안 함) — Excel write_excel_cell/write_excel_range,
+       Word replace_in_word/insert_word_text, PowerPoint set_powerpoint_text/
+       replace_in_powerpoint/set_shape_size/set_shape_position/format_shape/
+       add_text_box/add_shape/add_slide/delete_shape. **사용자 세션에 열려 있는**
+       문서만 수정하고 디스크에는 쓰지 않는다(저장 전까지 파일 원본은 그대로). Excel의
+       COM 수정은 실행 취소(Ctrl+Z) 스택에 쌓이지 않아 복구용으로 이전 값을 응답에 담아
+       돌려주고, Word/PowerPoint는 저장 전이라 Ctrl+Z나 '저장 없이 닫기'로 되돌릴 수 있다.
+    🔴 디스크 기록 — save_workbook(Excel)/save_document(Word)/save_presentation(PPT)
+       덮어쓰기 저장. confirm=True 없이는 실행되지 않고 무엇을 할지 프리뷰만 돌려준다
+       (_preview — outlook/catia와 같은 게이트).
 
 path 인자 규칙 (모든 문서 도구 공통)
     path=None  -> 해당 앱에서 지금 활성화된 문서를 읽습니다.
@@ -53,12 +58,15 @@ except ImportError as e:  # Windows가 아니거나 pywin32 미설치
 mcp = FastMCP(
     name="office",
     instructions=(
-        "Word/Excel/PowerPoint 문서를 읽고 Excel 셀을 수정하는 MCP 서버입니다. "
+        "Word/Excel/PowerPoint 문서를 읽고 수정하는 MCP 서버입니다. "
         "path를 생략하면 지금 열려 있는 활성 문서를 읽습니다. "
         "어떤 문서가 열려 있는지 모르면 list_open_documents를 먼저 호출하세요. "
-        "Excel 쓰기(write_excel_cell/write_excel_range)는 열려 있는 통합문서의 메모리만 "
-        "바꾸고 저장하지 않습니다 — 디스크 저장은 save_workbook이 담당하며 confirm=True "
-        "없이 부르면 프리뷰만 돌려줍니다."
+        "Word 특정 섹션만 읽으려면 read_word_section을, PowerPoint 도형을 수정하기 전 "
+        "번호·크기를 확인하려면 list_slide_shapes를 쓰세요. "
+        "쓰기(Excel write_excel_*, Word replace_in_word/insert_word_text, PowerPoint "
+        "set_powerpoint_text/set_shape_size/add_shape 등)는 열려 있는 문서의 메모리만 "
+        "바꾸고 저장하지 않습니다 — 디스크 저장은 save_workbook/save_document/"
+        "save_presentation이 담당하며 confirm=True 없이 부르면 프리뷰만 돌려줍니다."
     ),
 )
 
@@ -86,6 +94,14 @@ WD_BODY_TEXT = 10  # wdOutlineLevelBodyText — 이 값 미만이면 제목 단�
 WD_GOTO_PAGE = 1  # wdGoToPage
 WD_GOTO_ABSOLUTE = 1  # wdGoToAbsolute
 WD_STAT_PAGES = 2  # wdStatisticPages
+# Word 쓰기용 상수 (win32com.client.constants를 쓸 수 없어 값으로 직접 둔다)
+WD_FIND_STOP = 0  # wdFindStop — 문서 끝에서 멈춤(개수 세기용)
+WD_FIND_CONTINUE = 1  # wdFindContinue — 끝까지 이어서 바꾸기
+WD_REPLACE_ONE = 1  # wdReplaceOne
+WD_REPLACE_ALL = 2  # wdReplaceAll
+WD_COLLAPSE_START = 1  # wdCollapseStart
+WD_COLLAPSE_END = 0  # wdCollapseEnd
+WD_NO_PROTECTION = -1  # wdNoProtection — 이 값이 아니면 편집 제한이 걸려 있다
 WD_REVISION_TYPES = {  # WdRevisionType
     0: "변경 없음",
     1: "삽입",
@@ -109,6 +125,63 @@ WD_REVISION_TYPES = {  # WdRevisionType
     19: "셀 분할",
     20: "충돌 삽입",
     21: "충돌 삭제",
+}
+
+# PowerPoint 쓰기용 상수 (win32com.client.constants를 쓸 수 없어 값으로 직접 둔다)
+MSO_TEXT_HORIZONTAL = 1  # msoTextOrientationHorizontal
+PP_ALIGN = {"left": 1, "center": 2, "right": 3, "justify": 4}  # PpParagraphAlignment
+# MsoShapeType — list_slide_shapes에서 도형 종류를 사람이 읽을 이름으로.
+MSO_SHAPE_TYPES = {
+    1: "자동도형", 2: "콜아웃", 3: "차트", 4: "코멘트", 5: "자유형", 6: "그룹",
+    7: "임베디드개체", 8: "폼컨트롤", 9: "선", 11: "OLE개체", 12: "미디어",
+    13: "그림", 14: "개체틀", 17: "텍스트상자", 19: "표", 20: "워드아트",
+    21: "잉크", 24: "다이어그램", 26: "3D모델",
+}
+# 자주 쓰는 MsoAutoShapeType (add_shape의 friendly 이름 → 값).
+# COM이 거부하는 값을 주면 com_error가 나므로, 그때는 유효 이름 목록으로 안내한다.
+PPT_AUTO_SHAPES = {
+    "rectangle": 1, "사각형": 1,
+    "rounded_rectangle": 5, "둥근사각형": 5,
+    "oval": 9, "ellipse": 9, "타원": 9, "원": 9,
+    "triangle": 7, "삼각형": 7,
+    "right_triangle": 8, "직각삼각형": 8,
+    "diamond": 4, "마름모": 4,
+    "parallelogram": 2, "평행사변형": 2,
+    "trapezoid": 3, "사다리꼴": 3,
+    "pentagon": 12, "오각형": 12,
+    "hexagon": 10, "육각형": 10,
+    "octagon": 6, "팔각형": 6,
+    "cross": 11, "십자": 11,
+    "can": 13, "원통": 13,
+    "cube": 14, "정육면체": 14,
+    "heart": 21, "하트": 21,
+    "sun": 23, "해": 23,
+    "moon": 24, "달": 24,
+    "smiley": 17, "웃는얼굴": 17,
+    "lightning": 22, "번개": 22,
+    "arc": 25, "호": 25,
+    "right_arrow": 33, "오른쪽화살표": 33,
+    "left_arrow": 34, "왼쪽화살표": 34,
+    "up_arrow": 35, "위쪽화살표": 35,
+    "down_arrow": 36, "아래쪽화살표": 36,
+    "left_right_arrow": 37, "좌우화살표": 37,
+    "star": 92, "별": 92,
+    "chevron": 52, "갈매기": 52,
+}
+# PpSlideLayout (add_slide의 friendly 이름 → 값).
+PPT_SLIDE_LAYOUTS = {
+    "blank": 12, "빈": 12,
+    "title": 1, "제목": 1,
+    "title_only": 11, "제목만": 11,
+    "text": 2, "제목과내용": 2,
+    "two_column": 3, "2단": 3,
+    "object": 7, "개체": 7,
+}
+# 단위 → 포인트(pt) 환산. PowerPoint COM의 Left/Top/Width/Height는 포인트 단위다.
+PPT_UNIT_TO_PT = {
+    "pt": 1.0, "point": 1.0, "points": 1.0,
+    "cm": 28.3464567, "mm": 2.83464567,
+    "in": 72.0, "inch": 72.0, "inches": 72.0,
 }
 
 _APPS = {
@@ -1570,6 +1643,354 @@ def find_in_word(
         return f"{head}\n\n{len(hits)}개 발견:\n" + "\n".join(hits) + note
 
 
+@mcp.tool()
+@office_tool
+def read_word_section(
+    heading: str,
+    path: str = "",
+    include_subsections: bool = True,
+    occurrence: int = 1,
+    max_chars: int = MAX_CHARS,
+    password: str = "",
+) -> str:
+    """Word 문서에서 특정 제목(섹션)에 해당하는 부분만 골라 읽습니다.
+
+    긴 문서 전체를 읽지 않고 "○○ 항목만", "결론 부분만"처럼 한 섹션만 볼 때
+    사용합니다. read_word_outline으로 제목 구조를 먼저 확인하면 heading을 정하기
+    쉽습니다. 제목은 제목 스타일(개요 수준)이 지정된 단락만 대상으로 하며,
+    부분 일치(대소문자 무시)로 찾습니다.
+
+    Args:
+        heading: 읽을 섹션의 제목(부분 문자열 가능). 예: '3. 시험 결과'.
+        path: .docx/.doc 파일 경로. 생략하면 Word의 활성 문서(저장 전 편집 내용 포함).
+        include_subsections: True(기본)면 하위 제목의 내용까지 포함합니다.
+            False면 같은/상위 제목이 아니라 다음 제목이 처음 나오기 전까지,
+            즉 이 제목 바로 아래 본문만 읽습니다.
+        occurrence: 같은 제목이 여러 번 나올 때 몇 번째를 읽을지(1부터). 기본 1.
+        max_chars: 반환할 최대 글자 수. 기본 20000.
+        password: 문서에 열기 암호가 걸려 있을 때 지정합니다.
+
+    Returns:
+        해당 섹션의 제목과 본문 텍스트. 제목을 못 찾으면 문서의 제목 목록을 안내합니다.
+    """
+    if not heading or not heading.strip():
+        return "heading(읽을 섹션 제목)이 비어 있습니다."
+    needle = heading.strip().lower()
+
+    with _document("word", path, password) as doc:
+        head = f"문서: {_doc_label(doc, path)}"
+        paras = list(doc.Paragraphs)
+
+        # (인덱스, 개요수준, 제목텍스트) — 제목 스타일이 지정된 단락만 모은다.
+        headings = []
+        for i, para in enumerate(paras):
+            try:
+                level = int(para.OutlineLevel)
+            except Exception:
+                continue
+            if level >= WD_BODY_TEXT:
+                continue
+            text = _clean(para.Range.Text)
+            if text:
+                headings.append((i, level, text))
+
+        matches = [h for h in headings if needle in h[2].lower()]
+        if not matches:
+            if not headings:
+                return (
+                    f"{head}\n\n제목 스타일이 지정된 단락이 없어 섹션을 고를 수 없습니다. "
+                    "read_word_document로 본문을 직접 읽거나 find_in_word로 검색하세요."
+                )
+            sample = "\n".join(f"  - {t}" for _, _, t in headings[:30])
+            more = f"\n  …(제목 {len(headings)}개 중 30개만 표시)" if len(headings) > 30 else ""
+            return (
+                f"{head}\n\n'{heading}'과(와) 일치하는 제목을 찾지 못했습니다. "
+                f"문서의 제목 목록:\n{sample}{more}"
+            )
+
+        occ = occurrence if occurrence and occurrence >= 1 else 1
+        if occ > len(matches):
+            return (
+                f"{head}\n\n'{heading}'과(와) 일치하는 제목은 {len(matches)}개뿐인데 "
+                f"{occ}번째를 요청했습니다. occurrence를 1~{len(matches)}로 지정하세요."
+            )
+        start_i, level, htext = matches[occ - 1]
+
+        # 시작 제목 다음 단락부터, 이 섹션의 끝(같은/상위 수준 제목)까지 모은다.
+        collected: list[tuple[str, str]] = []  # (종류, 텍스트) — 종류: 'h'=하위제목 'b'=본문
+        for para in paras[start_i + 1:]:
+            try:
+                lv = int(para.OutlineLevel)
+            except Exception:
+                lv = WD_BODY_TEXT
+            is_heading = lv < WD_BODY_TEXT
+            if is_heading:
+                if include_subsections and lv > level:
+                    # 하위 제목 — 섹션에 포함해 소제목으로 표시하고 계속 읽는다.
+                    sub = _clean(para.Range.Text)
+                    if sub:
+                        collected.append(("h", sub))
+                    continue
+                break  # 같은/상위 수준 제목이거나 하위 미포함 → 섹션 끝
+            txt = _clean(para.Range.Text)
+            if txt:
+                collected.append(("b", txt))
+
+        lines = [f"── {htext} ──"]
+        for kind, t in collected:
+            if kind == "h":
+                lines.append("")
+                lines.append(f"[{t}]")
+            else:
+                lines.append(t)
+        body = "\n".join(lines)
+        if not collected:
+            body += "\n(이 섹션에는 본문 내용이 없습니다.)"
+
+        if len(matches) > 1:
+            head += f"  |  섹션: '{htext}' ({occ}/{len(matches)}번째 일치)"
+        else:
+            head += f"  |  섹션: '{htext}'"
+        return f"{head}\n\n{_truncate(body, max(100, max_chars))}"
+
+
+# ─────────────── Word 쓰기 (🟡 메모리 수정 / 🔴 저장 — 3티어) ───────────────
+# Excel 쓰기와 같은 원칙: 반드시 '사용자 세션에 열려 있는' 문서에만 쓴다.
+# _document가 안 열린 파일을 여는 백그라운드 인스턴스는 읽기 전용이라 거기에 쓰면
+# 닫을 때 조용히 버려진다 — 그래서 쓰기 도구는 _document가 아니라
+# _writable_document으로 사용자 세션 문서만 잡는다(_writable_workbook과 같은 구조).
+
+
+def _writable_document(path: str):
+    """수정 대상 Word 문서를 돌려준다 — 반드시 사용자 세션에 열려 있는 것만.
+
+    path 비움 → 활성 문서. path 지정 → Word에 열려 있으면 그 문서, 아니면 안내와
+    함께 실패한다(백그라운드로 열어 수정하면 변경이 버려지므로 열지 않는다).
+    읽기 전용이거나 편집 제한이 걸린 문서도 거절한다.
+    """
+    if not path:
+        doc = _active_doc("word")
+    else:
+        p = os.path.abspath(os.path.expanduser(path))
+        doc = _find_open_doc("word", p)
+        if doc is None:
+            raise OfficeError(
+                f"'{p}'이(가) Word에 열려 있지 않습니다. 쓰기 도구는 열려 있는 문서만 "
+                "수정합니다(안 열린 파일을 백그라운드로 열어 쓰면 변경이 버려집니다). "
+                "Word에서 파일을 연 뒤 다시 시도하세요."
+            )
+    try:
+        if bool(doc.ReadOnly):
+            raise OfficeError(f"'{doc.Name}'은(는) 읽기 전용으로 열려 있어 수정할 수 없습니다.")
+    except OfficeError:
+        raise
+    except Exception:  # noqa: BLE001 — 확인 불가면 일단 진행(쓰기 시점에 오류로 드러남)
+        pass
+    try:
+        if int(doc.ProtectionType) != WD_NO_PROTECTION:
+            raise OfficeError(
+                f"'{doc.Name}'에는 편집 제한(문서 보호)이 걸려 있어 수정할 수 없습니다. "
+                "Word에서 '편집 제한 중지'로 보호를 푼 뒤 다시 시도하세요."
+            )
+    except OfficeError:
+        raise
+    except Exception:  # noqa: BLE001 — ProtectionType을 못 읽으면 그냥 진행
+        pass
+    _ctx.user_session = True
+    return doc
+
+
+def _insert_text(rng, text: str, as_new_paragraph: bool, before: bool):
+    """Range 위치에 텍스트를 넣는다. as_new_paragraph면 단락 구분(\\r)을 함께 넣는다."""
+    if as_new_paragraph:
+        rng.InsertBefore(text + "\r") if before else rng.InsertAfter("\r" + text)
+    else:
+        rng.InsertBefore(text) if before else rng.InsertAfter(text)
+
+
+@mcp.tool()
+@office_tool
+def replace_in_word(
+    find_text: str,
+    replace_text: str,
+    path: str = "",
+    match_case: bool = False,
+    whole_word: bool = False,
+    replace_all: bool = True,
+) -> str:
+    """🟡 열려 있는 Word 문서에서 텍스트를 찾아 바꿉니다 (저장하지 않음).
+
+    "○○를 △△로 다 바꿔줘"처럼 문서의 특정 부분을 수정할 때 사용합니다.
+    디스크에는 쓰지 않으며(파일 저장은 save_document, confirm 필요), 바꾼 내용은
+    저장 전이라 Word에서 Ctrl+Z나 '저장 없이 닫기'로 되돌릴 수 있습니다.
+
+    Args:
+        find_text: 찾을 텍스트.
+        replace_text: 바꿀 텍스트. 빈 문자열이면 찾은 텍스트를 삭제합니다.
+        path: 파일 경로. 생략하면 활성 문서. **Word에 열려 있어야 합니다.**
+        match_case: True면 대소문자를 구분합니다. 기본 False.
+        whole_word: True면 단어 전체가 일치할 때만 바꿉니다. 기본 False.
+        replace_all: True(기본)면 모두 바꾸고, False면 첫 번째 하나만 바꿉니다.
+
+    Returns:
+        바꾼 곳 수와 저장 안내. 일치가 없으면 그 사실을 알립니다.
+    """
+    if not find_text:
+        return "find_text(찾을 텍스트)가 비어 있습니다."
+
+    doc = _writable_document(path)
+    head = f"문서: {_doc_label(doc, path)}"
+
+    # 실제 치환과 같은 조건으로 먼저 개수를 센다(치환 결과에 find_text가 다시
+    # 생겨도 개수가 흔들리지 않도록 치환 전에 별도 범위로 센다).
+    probe = doc.Content.Duplicate
+    pf = probe.Find
+    pf.ClearFormatting()
+    count = 0
+    while pf.Execute(find_text, match_case, whole_word, False, False, False, True, WD_FIND_STOP, False):
+        count += 1
+        probe.Collapse(WD_COLLAPSE_END)
+        if count >= 100000:  # 폭주 방지 상한
+            break
+    if count == 0:
+        return f"{head}\n\n'{find_text}'을(를) 찾지 못해 바꾼 내용이 없습니다."
+
+    rng = doc.Content
+    rf = rng.Find
+    rf.ClearFormatting()
+    rf.Replacement.ClearFormatting()
+    mode = WD_REPLACE_ALL if replace_all else WD_REPLACE_ONE
+    rf.Execute(
+        find_text, match_case, whole_word, False, False, False,
+        True, WD_FIND_CONTINUE, False, replace_text, mode,
+    )
+    done = count if replace_all else 1
+    verb = "삭제" if replace_text == "" else "치환"
+    return (
+        f"찾아 바꾸기 완료({verb}): '{find_text}' → "
+        f"{'(삭제)' if replace_text == '' else repr(replace_text)}  ({head})\n"
+        f"  바꾼 곳: {done}곳" + (f" (일치 {count}곳 중 첫 1곳만)" if not replace_all and count > 1 else "") + "\n"
+        "아직 저장하지 않았습니다 — 파일에 반영하려면 save_document를 호출하세요."
+    )
+
+
+@mcp.tool()
+@office_tool
+def insert_word_text(
+    text: str,
+    path: str = "",
+    position: str = "end",
+    anchor: str = "",
+    match_case: bool = False,
+    as_new_paragraph: bool = True,
+) -> str:
+    """🟡 열려 있는 Word 문서의 특정 위치에 텍스트를 입력합니다 (저장하지 않음).
+
+    문서 끝/처음에 문단을 덧붙이거나, 특정 문구(anchor)를 기준으로 그 앞·뒤에
+    끼워 넣거나, anchor 자체를 교체할 수 있습니다. 디스크에는 쓰지 않으며
+    (파일 저장은 save_document, confirm 필요), 저장 전이라 Word에서 Ctrl+Z나
+    '저장 없이 닫기'로 되돌릴 수 있습니다.
+
+    Args:
+        text: 넣을 텍스트.
+        path: 파일 경로. 생략하면 활성 문서. **Word에 열려 있어야 합니다.**
+        position: 넣을 위치.
+            'end'(기본) 문서 끝 / 'start' 문서 처음 /
+            'after' anchor 뒤 / 'before' anchor 앞 / 'replace' anchor를 text로 교체.
+            after/before/replace는 anchor가 필요합니다.
+        anchor: 기준이 될 기존 문구(부분 문자열). position이 after/before/replace일 때 사용.
+        match_case: anchor를 찾을 때 대소문자 구분. 기본 False.
+        as_new_paragraph: True(기본)면 새 문단으로 넣습니다(줄바꿈 포함).
+            False면 기존 문단에 이어 붙입니다. position이 'replace'면 무시됩니다.
+
+    Returns:
+        수행한 동작 요약과 저장 안내.
+    """
+    if not text:
+        return "text(넣을 텍스트)가 비어 있습니다."
+    pos = (position or "end").strip().lower()
+    valid = {"end", "start", "after", "before", "replace"}
+    if pos not in valid:
+        return f"position은 {', '.join(sorted(valid))} 중 하나여야 합니다. (받은 값: '{position}')"
+    if pos in ("after", "before", "replace") and not anchor:
+        return f"position='{pos}'에는 기준 문구 anchor가 필요합니다."
+
+    doc = _writable_document(path)
+    head = f"문서: {_doc_label(doc, path)}"
+
+    if pos in ("after", "before", "replace"):
+        rng = doc.Content
+        f = rng.Find
+        f.ClearFormatting()
+        # 찾기 전용(치환 인자 생략) — 성공하면 rng가 찾은 텍스트 범위로 바뀐다.
+        if not f.Execute(anchor, match_case, False, False, False, False, True, WD_FIND_STOP, False):
+            raise OfficeError(f"'{anchor}'을(를) 문서에서 찾지 못했습니다. anchor를 확인하세요.")
+        if pos == "replace":
+            rng.Text = text
+            action = f"'{anchor}'을(를) 교체"
+        elif pos == "after":
+            rng.Collapse(WD_COLLAPSE_END)
+            _insert_text(rng, text, as_new_paragraph, before=False)
+            action = f"'{anchor}' 뒤에 삽입"
+        else:  # before
+            rng.Collapse(WD_COLLAPSE_START)
+            _insert_text(rng, text, as_new_paragraph, before=True)
+            action = f"'{anchor}' 앞에 삽입"
+    else:
+        rng = doc.Content
+        if pos == "end":
+            rng.Collapse(WD_COLLAPSE_END)
+            _insert_text(rng, text, as_new_paragraph, before=False)
+            action = "문서 끝에 추가"
+        else:  # start
+            rng.Collapse(WD_COLLAPSE_START)
+            _insert_text(rng, text, as_new_paragraph, before=True)
+            action = "문서 처음에 추가"
+
+    preview = text if len(text) <= 60 else text[:60] + "…"
+    return (
+        f"입력 완료: {action}  ({head})\n"
+        f"  넣은 내용: {preview}\n"
+        "아직 저장하지 않았습니다 — 파일에 반영하려면 save_document를 호출하세요."
+    )
+
+
+@mcp.tool()
+@office_tool
+def save_document(path: str = "", confirm: bool = False) -> str:
+    """🔴 열려 있는 Word 문서를 현재 경로에 저장합니다(덮어쓰기). (confirm=True 필요)
+
+    replace_in_word/insert_word_text로 바꾼 내용을 디스크에 반영하는 단계입니다.
+    confirm 없이 부르면 어떤 파일을 덮어쓸지 프리뷰만 돌려줍니다.
+
+    Args:
+        path: 파일 경로. 생략하면 활성 문서. Word에 열려 있어야 합니다.
+        confirm: 실제 저장하려면 True. 없으면 프리뷰만.
+    """
+    doc = _writable_document(path)
+    try:
+        full = doc.FullName
+    except Exception:  # noqa: BLE001
+        full = ""
+    if not full or full == doc.Name or not os.path.isabs(full):
+        return (
+            "이 문서는 아직 디스크에 저장된 적이 없어 경로가 없습니다. "
+            "Word에서 먼저 '다른 이름으로 저장'해 경로를 정하세요."
+        )
+    changed = ""
+    try:
+        changed = "변경 있음(미저장)" if not doc.Saved else "변경 없음(이미 저장됨)"
+    except Exception:  # noqa: BLE001
+        pass
+    if not confirm:
+        details = [f"문서: {doc.Name}", f"경로: {full} (덮어쓰기)"]
+        if changed:
+            details.append(f"상태: {changed}")
+        return _preview("문서 저장(덮어쓰기)", details, "(save_document ... confirm=true)")
+    doc.Save()
+    return f"저장 완료.\n  경로: {full}"
+
+
 # ──────────────────────────── PowerPoint 도구 ────────────────────────────
 
 
@@ -1773,6 +2194,791 @@ def read_powerpoint_tables(
             return f"발표자료: {_doc_label(pres, path)}\n\n표가 있는 슬라이드가 없습니다."
         out.insert(1, f"표 {found}개")
         return _truncate("\n".join(out), MAX_CHARS)
+
+
+# ─────────── PowerPoint 쓰기 (🟡 메모리 수정 / 🔴 저장 — 3티어) ───────────
+# Word/Excel과 같은 원칙: 쓰기는 반드시 '사용자 세션에 열려 있는' 발표자료에만
+# 한다. _document가 백그라운드로 여는 인스턴스는 읽기용이라, 거기에 쓰면 닫을 때
+# 조용히 버려진다 — 그래서 쓰기 도구는 _document 대신 _writable_presentation을 쓴다.
+# 좌표·크기는 PowerPoint COM이 쓰는 포인트(pt) 단위이고, unit 인자로 cm/mm/in도 받는다.
+
+
+def _writable_presentation(path: str):
+    """수정 대상 발표자료를 돌려준다 — 반드시 사용자 세션에 열려 있는 것만.
+
+    path 비움 → 활성 발표자료. path 지정 → PowerPoint에 열려 있으면 그 발표자료,
+    아니면 안내와 함께 실패한다(백그라운드로 열어 수정하면 변경이 버려지므로 열지 않는다).
+    읽기 전용으로 열린 발표자료도 거절한다.
+    """
+    if not path:
+        pres = _active_doc("ppt")
+    else:
+        p = os.path.abspath(os.path.expanduser(path))
+        pres = _find_open_doc("ppt", p)
+        if pres is None:
+            raise OfficeError(
+                f"'{p}'이(가) PowerPoint에 열려 있지 않습니다. 쓰기 도구는 열려 있는 "
+                "발표자료만 수정합니다(안 열린 파일을 백그라운드로 열어 쓰면 변경이 "
+                "버려집니다). PowerPoint에서 파일을 연 뒤 다시 시도하세요."
+            )
+    try:
+        if bool(pres.ReadOnly):
+            raise OfficeError(f"'{pres.Name}'은(는) 읽기 전용으로 열려 있어 수정할 수 없습니다.")
+    except OfficeError:
+        raise
+    except Exception:  # noqa: BLE001 — 확인 불가면 일단 진행(쓰기 시점에 오류로 드러남)
+        pass
+    _ctx.user_session = True
+    return pres
+
+
+def _resolve_slide(pres, slide):
+    """1-based 슬라이드 번호를 Slide 객체로 바꾼다."""
+    total = pres.Slides.Count
+    try:
+        i = int(slide)
+    except (TypeError, ValueError):
+        raise OfficeError(f"슬라이드 번호는 정수여야 합니다(받은 값: '{slide}').")
+    if not (1 <= i <= total):
+        raise OfficeError(f"슬라이드 {slide}이(가) 없습니다. 이 발표자료는 전체 {total}장입니다.")
+    return pres.Slides(i)
+
+
+def _resolve_shape(slide, shape):
+    """도형을 1-based 번호 또는 이름으로 찾는다.
+
+    list_slide_shapes가 알려 주는 번호/이름을 그대로 받는다. 못 찾으면 그 슬라이드의
+    도형 목록을 곁들여 안내한다.
+    """
+    shapes = slide.Shapes
+    s = str(shape).strip()
+    if s.isdigit():
+        idx = int(s)
+        if not (1 <= idx <= shapes.Count):
+            raise OfficeError(
+                f"이 슬라이드에는 도형이 {shapes.Count}개뿐입니다(요청: {idx}번). "
+                "list_slide_shapes로 번호를 확인하세요."
+            )
+        return shapes.Item(idx)
+    try:
+        return shapes.Item(s)
+    except pythoncom.com_error:
+        names = []
+        for k in range(1, shapes.Count + 1):
+            try:
+                names.append(f"{k}:{shapes.Item(k).Name}")
+            except Exception:
+                names.append(str(k))
+        raise OfficeError(
+            f"'{shape}' 도형을 찾을 수 없습니다. 이 슬라이드의 도형: {', '.join(names) or '(없음)'}"
+        )
+
+
+def _to_points(value: float, unit: str) -> float:
+    """길이 값을 지정 단위에서 포인트(pt)로 환산한다."""
+    u = (unit or "pt").strip().lower()
+    if u not in PPT_UNIT_TO_PT:
+        raise OfficeError(
+            f"unit은 {', '.join(sorted(set(PPT_UNIT_TO_PT)))} 중 하나여야 합니다(받은 값: '{unit}')."
+        )
+    try:
+        return float(value) * PPT_UNIT_TO_PT[u]
+    except (TypeError, ValueError):
+        raise OfficeError(f"길이 값이 숫자가 아닙니다: '{value}'.")
+
+
+def _fmt_len(pt: float) -> str:
+    """포인트 길이를 pt와 cm로 함께 보여 준다(사람이 크기를 가늠하기 쉽게)."""
+    try:
+        return f"{pt:.1f}pt ({pt / 28.3464567:.2f}cm)"
+    except Exception:  # noqa: BLE001
+        return f"{pt}pt"
+
+
+def _hex_to_ole(color: str) -> int:
+    """'#RRGGBB' 또는 'RRGGBB'를 Office가 쓰는 OLE 색값(0xBBGGRR)으로 바꾼다."""
+    h = str(color).strip().lstrip("#")
+    if len(h) != 6:
+        raise OfficeError(f"색은 '#RRGGBB' 6자리 16진수로 지정하세요(받은 값: '{color}').")
+    try:
+        r, g, b = int(h[0:2], 16), int(h[2:4], 16), int(h[4:6], 16)
+    except ValueError:
+        raise OfficeError(f"색 '{color}'을(를) 16진수로 해석할 수 없습니다(예: '#1F4E79').")
+    return r + (g << 8) + (b << 16)
+
+
+def _shape_kind(shape) -> str:
+    """도형의 종류를 사람이 읽을 이름으로. 표/차트/텍스트는 더 구체적으로."""
+    try:
+        if shape.HasTable:
+            return "표"
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        if shape.HasChart:
+            return "차트"
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        return MSO_SHAPE_TYPES.get(int(shape.Type), f"종류{int(shape.Type)}")
+    except Exception:  # noqa: BLE001
+        return "도형"
+
+
+@mcp.tool()
+@office_tool
+def list_slide_shapes(slide: int, path: str = "", password: str = "") -> str:
+    """🟢 한 슬라이드의 도형 목록을 번호·이름·종류·위치·크기와 함께 조회합니다.
+
+    도형을 수정(set_powerpoint_text/set_shape_size/set_shape_position/format_shape)
+    하거나 지우기 전에, 대상 도형의 '번호'나 '이름'을 먼저 확인하는 용도입니다.
+    위치·크기는 포인트(pt)와 cm로 함께 보여 줍니다.
+
+    Args:
+        slide: 슬라이드 번호(1부터). read_powerpoint_outline로 확인하세요.
+        path: 파일 경로. 생략하면 활성 발표자료.
+        password: 발표자료에 열기 암호가 걸려 있을 때 지정합니다.
+
+    Returns:
+        도형별 번호·이름·종류·위치(left,top)·크기(width,height)·텍스트 미리보기.
+    """
+    with _document("ppt", path, password) as pres:
+        slide_obj = _resolve_slide(pres, slide)
+        shapes = slide_obj.Shapes
+        out = [
+            f"발표자료: {_doc_label(pres, path)}  |  슬라이드 {slide}: {_slide_title(slide_obj)}",
+            f"도형 {shapes.Count}개",
+            "",
+        ]
+        for k in range(1, shapes.Count + 1):
+            shape = shapes.Item(k)
+            try:
+                name = shape.Name
+            except Exception:  # noqa: BLE001
+                name = "?"
+            kind = _shape_kind(shape)
+            try:
+                pos = f"위치({_fmt_len(shape.Left)}, {_fmt_len(shape.Top)})"
+                size = f"크기({_fmt_len(shape.Width)} × {_fmt_len(shape.Height)})"
+            except Exception:  # noqa: BLE001 — 선/그룹 등 일부는 위치·크기가 없다
+                pos, size = "위치(?)", "크기(?)"
+            out.append(f"  [{k}] {name}  · {kind}")
+            out.append(f"      {pos}  {size}")
+            try:
+                if shape.HasTextFrame and shape.TextFrame.HasText:
+                    txt = _clean(shape.TextFrame.TextRange.Text)
+                    if txt:
+                        preview = txt if len(txt) <= 60 else txt[:60] + "…"
+                        out.append(f"      텍스트: {preview}")
+            except Exception:  # noqa: BLE001
+                pass
+        if shapes.Count == 0:
+            out.append("  (도형 없음)")
+        return _truncate("\n".join(out), MAX_CHARS)
+
+
+@mcp.tool()
+@office_tool
+def set_powerpoint_text(slide: int, shape: str, text: str, path: str = "") -> str:
+    """🟡 열려 있는 발표자료에서 한 도형의 텍스트를 통째로 바꿉니다 (저장하지 않음).
+
+    제목/본문/텍스트 상자 등 텍스트를 담을 수 있는 도형의 내용을 새 text로 교체합니다.
+    디스크에는 쓰지 않으며(저장은 save_presentation, confirm 필요), 저장 전이라
+    PowerPoint에서 Ctrl+Z로 되돌릴 수 있습니다.
+
+    Args:
+        slide: 슬라이드 번호(1부터).
+        shape: 대상 도형의 번호 또는 이름(list_slide_shapes로 확인).
+        text: 새 텍스트. 여러 줄은 개행(\\n)으로 구분합니다.
+        path: 파일 경로. 생략하면 활성 발표자료. **PowerPoint에 열려 있어야 합니다.**
+
+    Returns:
+        바꾸기 전/후 텍스트 요약과 저장 안내.
+    """
+    pres = _writable_presentation(path)
+    slide_obj = _resolve_slide(pres, slide)
+    shape_obj = _resolve_shape(slide_obj, shape)
+    try:
+        has_tf = bool(shape_obj.HasTextFrame)
+    except Exception:  # noqa: BLE001
+        has_tf = False
+    if not has_tf:
+        raise OfficeError(
+            f"'{shape_obj.Name}' 도형은 텍스트를 담을 수 없습니다(그림/선 등). "
+            "텍스트 상자나 개체틀을 대상으로 지정하세요."
+        )
+    tr = shape_obj.TextFrame.TextRange
+    try:
+        old = _clean(tr.Text)
+    except Exception:  # noqa: BLE001
+        old = "(읽기 실패)"
+    # PowerPoint는 개행을 \r로 다룬다.
+    tr.Text = str(text).replace("\r\n", "\n").replace("\n", "\r")
+    old_p = old if len(old) <= 60 else old[:60] + "…"
+    new_p = str(text) if len(str(text)) <= 60 else str(text)[:60] + "…"
+    return (
+        f"텍스트 교체: 슬라이드 {slide} / '{shape_obj.Name}' (발표자료: {_doc_label(pres, path)})\n"
+        f"  이전: {old_p if old else '(빈 텍스트)'}\n"
+        f"  이후: {new_p}\n"
+        "아직 저장하지 않았습니다 — 파일에 반영하려면 save_presentation을 호출하세요."
+    )
+
+
+@mcp.tool()
+@office_tool
+def replace_in_powerpoint(
+    find_text: str,
+    replace_text: str,
+    path: str = "",
+    slides: str = "",
+    match_case: bool = False,
+    whole_word: bool = False,
+    replace_all: bool = True,
+) -> str:
+    """🟡 열려 있는 발표자료의 텍스트를 찾아 바꿉니다 (여러 슬라이드, 저장하지 않음).
+
+    "○○를 △△로 다 바꿔줘"처럼 발표자료 전반의 문구를 일괄 수정할 때 씁니다.
+    각 도형의 TextRange.Replace를 써서 서식은 유지한 채 글자만 바꿉니다.
+    디스크에는 쓰지 않으며(저장은 save_presentation), Ctrl+Z로 되돌릴 수 있습니다.
+
+    Args:
+        find_text: 찾을 텍스트.
+        replace_text: 바꿀 텍스트. 빈 문자열이면 찾은 텍스트를 삭제합니다.
+        path: 파일 경로. 생략하면 활성 발표자료. **PowerPoint에 열려 있어야 합니다.**
+        slides: 대상 슬라이드. '3', '2-5', '1,4,7' 형식. 생략하면 전체.
+        match_case: True면 대소문자를 구분합니다. 기본 False.
+        whole_word: True면 단어 전체가 일치할 때만 바꿉니다. 기본 False.
+        replace_all: True(기본)면 모두 바꾸고, False면 슬라이드마다 첫 하나만 바꿉니다.
+
+    Returns:
+        바꾼 곳 수와 저장 안내. 일치가 없으면 그 사실을 알립니다.
+    """
+    if not find_text:
+        return "find_text(찾을 텍스트)가 비어 있습니다."
+    pres = _writable_presentation(path)
+    total = pres.Slides.Count
+    indices = _parse_index_range(slides, total, "슬라이드")
+    head = f"발표자료: {_doc_label(pres, path)}"
+
+    mc = MSO_TRUE if match_case else MSO_FALSE
+    ww = MSO_TRUE if whole_word else MSO_FALSE
+    count = 0
+    for i in indices:
+        slide_obj = pres.Slides(i)
+        for shape in slide_obj.Shapes:
+            try:
+                if not (shape.HasTextFrame and shape.TextFrame.HasText):
+                    continue
+                tr = shape.TextFrame.TextRange
+            except Exception:  # noqa: BLE001
+                continue
+            matched = False
+            # TextRange.Replace(FindWhat, ReplaceWhat, After, MatchCase, WholeWords)는
+            # 한 번에 하나를 바꾸고 바뀐 범위를 돌려준다(끝나면 None). 인자는 pywin32가
+            # 키워드를 흘릴 수 있어 위치로 넘긴다. After(시작 문자 위치)를 옮겨 이어 찾는다.
+            start = 0
+            while True:
+                try:
+                    found = tr.Replace(find_text, replace_text, start, mc, ww)
+                except pythoncom.com_error:
+                    break
+                if not found or _clean(getattr(found, "Text", "")) == "":
+                    break
+                count += 1
+                matched = True
+                if not replace_all:
+                    break
+                try:
+                    # 바뀐 텍스트 끝 다음부터 이어 찾는다(치환문에 find_text가 또 있어도 무한루프 방지).
+                    start = int(found.Start) + max(len(replace_text), 1)
+                except Exception:  # noqa: BLE001
+                    break
+                if count >= 100000:  # 폭주 방지 상한
+                    break
+            if matched and not replace_all:
+                # replace_all=False는 슬라이드마다 첫 하나만 — 다음 슬라이드로.
+                break
+    if count == 0:
+        return f"{head}\n\n'{find_text}'을(를) 찾지 못해 바꾼 내용이 없습니다."
+    verb = "삭제" if replace_text == "" else "치환"
+    return (
+        f"찾아 바꾸기 완료({verb}): '{find_text}' → "
+        f"{'(삭제)' if replace_text == '' else repr(replace_text)}  ({head})\n"
+        f"  바꾼 곳: {count}곳 (슬라이드 {len(indices)}장 대상)\n"
+        "아직 저장하지 않았습니다 — 파일에 반영하려면 save_presentation을 호출하세요."
+    )
+
+
+@mcp.tool()
+@office_tool
+def get_shape_size(slide: int, shape: str, path: str = "", password: str = "") -> str:
+    """🟢 한 도형의 현재 위치와 크기를 조회합니다 (pt·cm·inch 함께).
+
+    크기를 바꾸기(set_shape_size) 전에 현재 값을 확인하거나, 여러 도형의 크기를
+    맞출 때 기준값을 얻는 용도입니다. 도형 하나만 빠르게 볼 때 씁니다
+    (슬라이드 전체는 list_slide_shapes).
+
+    Args:
+        slide: 슬라이드 번호(1부터).
+        shape: 도형 번호 또는 이름(list_slide_shapes로 확인).
+        path: 파일 경로. 생략하면 활성 발표자료.
+        password: 발표자료에 열기 암호가 걸려 있을 때 지정합니다.
+
+    Returns:
+        위치(left, top)·크기(width, height)를 pt/cm/inch로.
+    """
+    with _document("ppt", path, password) as pres:
+        slide_obj = _resolve_slide(pres, slide)
+        shape_obj = _resolve_shape(slide_obj, shape)
+        try:
+            left, top = shape_obj.Left, shape_obj.Top
+            width, height = shape_obj.Width, shape_obj.Height
+        except Exception:  # noqa: BLE001
+            raise OfficeError(
+                f"'{shape_obj.Name}' 도형의 위치·크기를 읽을 수 없습니다(선/그룹 등일 수 있음)."
+            )
+
+        def _triple(pt):
+            return f"{pt:.1f}pt / {pt / 28.3464567:.2f}cm / {pt / 72.0:.2f}in"
+
+        return (
+            f"발표자료: {_doc_label(pres, path)}  |  슬라이드 {slide} / '{shape_obj.Name}' "
+            f"({_shape_kind(shape_obj)})\n"
+            f"  위치 left : {_triple(left)}\n"
+            f"  위치 top  : {_triple(top)}\n"
+            f"  너비 width : {_triple(width)}\n"
+            f"  높이 height: {_triple(height)}"
+        )
+
+
+@mcp.tool()
+@office_tool
+def set_shape_size(
+    slide: int,
+    shape: str,
+    width: float | None = None,
+    height: float | None = None,
+    unit: str = "pt",
+    lock_aspect: bool = False,
+    path: str = "",
+) -> str:
+    """🟡 한 도형의 크기(너비·높이)를 바꿉니다 (저장하지 않음).
+
+    width/height 중 준 것만 바꿉니다(하나만 주면 그 한 변만). 디스크에는 쓰지 않으며
+    (저장은 save_presentation), Ctrl+Z로 되돌릴 수 있습니다.
+
+    Args:
+        slide: 슬라이드 번호(1부터).
+        shape: 도형 번호 또는 이름(list_slide_shapes로 확인).
+        width: 새 너비. 생략하면 너비는 그대로.
+        height: 새 높이. 생략하면 높이는 그대로.
+        unit: width/height의 단위. 'pt'(기본)/'cm'/'mm'/'in'.
+        lock_aspect: True면 가로세로 비율을 고정합니다(한 변만 줘도 다른 변이 따라옴).
+            이때는 width나 height 중 하나만 주는 것이 자연스럽습니다.
+        path: 파일 경로. 생략하면 활성 발표자료. **PowerPoint에 열려 있어야 합니다.**
+
+    Returns:
+        바꾸기 전/후 크기와 저장 안내.
+    """
+    if width is None and height is None:
+        return "width나 height 중 적어도 하나는 지정하세요."
+    pres = _writable_presentation(path)
+    slide_obj = _resolve_slide(pres, slide)
+    shape_obj = _resolve_shape(slide_obj, shape)
+    try:
+        old_w, old_h = float(shape_obj.Width), float(shape_obj.Height)
+    except Exception:  # noqa: BLE001
+        raise OfficeError(f"'{shape_obj.Name}' 도형은 크기를 바꿀 수 없습니다(선/그룹 등일 수 있음).")
+
+    try:
+        # msoTrue=-1 / msoFalse=0. 비율 고정을 켜면 한 변만 줘도 나머지가 따라온다.
+        shape_obj.LockAspectRatio = MSO_TRUE if lock_aspect else MSO_FALSE
+    except Exception:  # noqa: BLE001
+        pass
+    if width is not None:
+        shape_obj.Width = _to_points(width, unit)
+    if height is not None:
+        shape_obj.Height = _to_points(height, unit)
+    return (
+        f"크기 변경: 슬라이드 {slide} / '{shape_obj.Name}' (발표자료: {_doc_label(pres, path)})\n"
+        f"  이전: {_fmt_len(old_w)} × {_fmt_len(old_h)}\n"
+        f"  이후: {_fmt_len(shape_obj.Width)} × {_fmt_len(shape_obj.Height)}"
+        + (f"  (비율 고정)" if lock_aspect else "") + "\n"
+        "아직 저장하지 않았습니다 — 파일에 반영하려면 save_presentation을 호출하세요."
+    )
+
+
+@mcp.tool()
+@office_tool
+def set_shape_position(
+    slide: int, shape: str, left: float | None = None, top: float | None = None,
+    unit: str = "pt", path: str = ""
+) -> str:
+    """🟡 한 도형의 위치(left·top)를 바꿉니다 (저장하지 않음).
+
+    슬라이드 왼쪽 위 모서리 기준의 좌표로 도형을 옮깁니다. left/top 중 준 것만
+    바꿉니다. 디스크에는 쓰지 않으며(저장은 save_presentation), Ctrl+Z로 되돌립니다.
+
+    Args:
+        slide: 슬라이드 번호(1부터).
+        shape: 도형 번호 또는 이름(list_slide_shapes로 확인).
+        left: 새 왼쪽 좌표. 생략하면 그대로.
+        top: 새 위쪽 좌표. 생략하면 그대로.
+        unit: left/top의 단위. 'pt'(기본)/'cm'/'mm'/'in'.
+        path: 파일 경로. 생략하면 활성 발표자료. **PowerPoint에 열려 있어야 합니다.**
+
+    Returns:
+        바꾸기 전/후 위치와 저장 안내.
+    """
+    if left is None and top is None:
+        return "left나 top 중 적어도 하나는 지정하세요."
+    pres = _writable_presentation(path)
+    slide_obj = _resolve_slide(pres, slide)
+    shape_obj = _resolve_shape(slide_obj, shape)
+    try:
+        old_l, old_t = float(shape_obj.Left), float(shape_obj.Top)
+    except Exception:  # noqa: BLE001
+        raise OfficeError(f"'{shape_obj.Name}' 도형은 위치를 바꿀 수 없습니다(선/그룹 등일 수 있음).")
+    if left is not None:
+        shape_obj.Left = _to_points(left, unit)
+    if top is not None:
+        shape_obj.Top = _to_points(top, unit)
+    return (
+        f"위치 변경: 슬라이드 {slide} / '{shape_obj.Name}' (발표자료: {_doc_label(pres, path)})\n"
+        f"  이전: left {_fmt_len(old_l)}, top {_fmt_len(old_t)}\n"
+        f"  이후: left {_fmt_len(shape_obj.Left)}, top {_fmt_len(shape_obj.Top)}\n"
+        "아직 저장하지 않았습니다 — 파일에 반영하려면 save_presentation을 호출하세요."
+    )
+
+
+@mcp.tool()
+@office_tool
+def format_shape(
+    slide: int,
+    shape: str,
+    font_size: float | None = None,
+    bold: bool | None = None,
+    italic: bool | None = None,
+    font_color: str = "",
+    fill_color: str = "",
+    align: str = "",
+    path: str = "",
+) -> str:
+    """🟡 한 도형의 글꼴·색·정렬·채우기를 바꿉니다 (저장하지 않음).
+
+    도형 전체 텍스트에 글꼴 크기/굵게/기울임/글자색/정렬을 적용하고, 도형 배경을
+    fill_color로 채웁니다. 준 인자만 반영합니다. 디스크에는 쓰지 않습니다.
+
+    Args:
+        slide: 슬라이드 번호(1부터).
+        shape: 도형 번호 또는 이름(list_slide_shapes로 확인).
+        font_size: 글꼴 크기(pt). 생략하면 그대로.
+        bold: 굵게 여부(True/False). 생략하면 그대로.
+        italic: 기울임 여부(True/False). 생략하면 그대로.
+        font_color: 글자색 '#RRGGBB'. 생략하면 그대로.
+        fill_color: 도형 배경색 '#RRGGBB'. 생략하면 그대로.
+        align: 문단 정렬 'left'/'center'/'right'/'justify'. 생략하면 그대로.
+        path: 파일 경로. 생략하면 활성 발표자료. **PowerPoint에 열려 있어야 합니다.**
+
+    Returns:
+        적용한 서식 요약과 저장 안내.
+    """
+    pres = _writable_presentation(path)
+    slide_obj = _resolve_slide(pres, slide)
+    shape_obj = _resolve_shape(slide_obj, shape)
+    applied = []
+
+    if fill_color:
+        try:
+            shape_obj.Fill.Solid()
+            shape_obj.Fill.ForeColor.RGB = _hex_to_ole(fill_color)
+            applied.append(f"채우기 {fill_color}")
+        except OfficeError:
+            raise
+        except Exception:  # noqa: BLE001
+            raise OfficeError(f"'{shape_obj.Name}' 도형에 채우기 색을 적용할 수 없습니다.")
+
+    text_opts = (font_size is not None or bold is not None or italic is not None
+                 or font_color or align)
+    if text_opts:
+        try:
+            has_tf = bool(shape_obj.HasTextFrame)
+        except Exception:  # noqa: BLE001
+            has_tf = False
+        if not has_tf:
+            raise OfficeError(
+                f"'{shape_obj.Name}' 도형은 텍스트가 없어 글꼴/정렬을 바꿀 수 없습니다."
+            )
+        tr = shape_obj.TextFrame.TextRange
+        font = tr.Font
+        if font_size is not None:
+            font.Size = float(font_size)
+            applied.append(f"크기 {font_size}pt")
+        if bold is not None:
+            font.Bold = MSO_TRUE if bold else MSO_FALSE
+            applied.append("굵게" if bold else "굵게 해제")
+        if italic is not None:
+            font.Italic = MSO_TRUE if italic else MSO_FALSE
+            applied.append("기울임" if italic else "기울임 해제")
+        if font_color:
+            font.Color.RGB = _hex_to_ole(font_color)
+            applied.append(f"글자색 {font_color}")
+        if align:
+            a = align.strip().lower()
+            if a not in PP_ALIGN:
+                raise OfficeError(f"align은 {', '.join(PP_ALIGN)} 중 하나여야 합니다(받은 값: '{align}').")
+            tr.ParagraphFormat.Alignment = PP_ALIGN[a]
+            applied.append(f"정렬 {a}")
+
+    if not applied:
+        return "바꿀 서식 인자를 하나도 지정하지 않았습니다(font_size/bold/italic/font_color/fill_color/align)."
+    return (
+        f"서식 적용: 슬라이드 {slide} / '{shape_obj.Name}' (발표자료: {_doc_label(pres, path)})\n"
+        f"  적용: {', '.join(applied)}\n"
+        "아직 저장하지 않았습니다 — 파일에 반영하려면 save_presentation을 호출하세요."
+    )
+
+
+def _report_new_shape(shape, slide: int, pres, path: str, kind: str) -> str:
+    """add_* 도구가 만든 도형을 번호·이름·위치·크기로 요약해 돌려준다."""
+    try:
+        num = shape.Parent.Shapes.Count  # 새로 추가된 도형은 맨 끝
+    except Exception:  # noqa: BLE001
+        num = "?"
+    try:
+        pos = f"위치({_fmt_len(shape.Left)}, {_fmt_len(shape.Top)}), 크기({_fmt_len(shape.Width)} × {_fmt_len(shape.Height)})"
+    except Exception:  # noqa: BLE001
+        pos = ""
+    return (
+        f"{kind} 추가: 슬라이드 {slide} / '{shape.Name}' [{num}번]  "
+        f"(발표자료: {_doc_label(pres, path)})\n"
+        + (f"  {pos}\n" if pos else "")
+        + "아직 저장하지 않았습니다 — 파일에 반영하려면 save_presentation을 호출하세요."
+    )
+
+
+@mcp.tool()
+@office_tool
+def add_text_box(
+    slide: int,
+    text: str,
+    left: float = 50,
+    top: float = 50,
+    width: float = 300,
+    height: float = 60,
+    unit: str = "pt",
+    font_size: float | None = None,
+    bold: bool | None = None,
+    font_color: str = "",
+    path: str = "",
+) -> str:
+    """🟡 슬라이드에 새 텍스트 상자를 만들고 글을 넣습니다 (저장하지 않음).
+
+    자유롭게 배치할 설명·주석·라벨을 추가할 때 씁니다. 위치·크기는 unit 단위,
+    글꼴 옵션은 선택입니다. 디스크에는 쓰지 않으며(저장은 save_presentation),
+    Ctrl+Z로 되돌릴 수 있습니다.
+
+    Args:
+        slide: 슬라이드 번호(1부터).
+        text: 넣을 텍스트. 여러 줄은 개행(\\n)으로 구분합니다.
+        left: 왼쪽 좌표(기본 50). top: 위쪽 좌표(기본 50).
+        width: 너비(기본 300). height: 높이(기본 60).
+        unit: 위 좌표·크기의 단위. 'pt'(기본)/'cm'/'mm'/'in'.
+        font_size: 글꼴 크기(pt). 생략하면 기본값.
+        bold: 굵게 여부. 생략하면 기본값.
+        font_color: 글자색 '#RRGGBB'. 생략하면 기본값.
+        path: 파일 경로. 생략하면 활성 발표자료. **PowerPoint에 열려 있어야 합니다.**
+
+    Returns:
+        새로 만든 텍스트 상자의 번호·이름·위치·크기와 저장 안내.
+    """
+    pres = _writable_presentation(path)
+    slide_obj = _resolve_slide(pres, slide)
+    box = slide_obj.Shapes.AddTextbox(
+        MSO_TEXT_HORIZONTAL,
+        _to_points(left, unit), _to_points(top, unit),
+        _to_points(width, unit), _to_points(height, unit),
+    )
+    tr = box.TextFrame.TextRange
+    tr.Text = str(text).replace("\r\n", "\n").replace("\n", "\r")
+    if font_size is not None:
+        tr.Font.Size = float(font_size)
+    if bold is not None:
+        tr.Font.Bold = MSO_TRUE if bold else MSO_FALSE
+    if font_color:
+        tr.Font.Color.RGB = _hex_to_ole(font_color)
+    return _report_new_shape(box, slide, pres, path, "텍스트 상자")
+
+
+@mcp.tool()
+@office_tool
+def add_shape(
+    slide: int,
+    shape_type: str,
+    left: float = 50,
+    top: float = 50,
+    width: float = 150,
+    height: float = 100,
+    unit: str = "pt",
+    text: str = "",
+    fill_color: str = "",
+    path: str = "",
+) -> str:
+    """🟡 슬라이드에 도형(사각형·원·화살표 등)을 만듭니다 (저장하지 않음).
+
+    다이어그램 블록·강조 도형·화살표 등을 그릴 때 씁니다. 도형 안에 text를 넣거나
+    fill_color로 배경을 칠할 수 있습니다. 디스크에는 쓰지 않습니다(저장은
+    save_presentation).
+
+    Args:
+        slide: 슬라이드 번호(1부터).
+        shape_type: 도형 종류. 예: 'rectangle', 'rounded_rectangle', 'oval',
+            'triangle', 'diamond', 'right_arrow', 'star' 등(한글 별칭도 가능:
+            '사각형','타원','화살표' 등). 지원 목록은 잘못된 값을 주면 안내됩니다.
+        left: 왼쪽 좌표(기본 50). top: 위쪽 좌표(기본 50).
+        width: 너비(기본 150). height: 높이(기본 100).
+        unit: 위 좌표·크기의 단위. 'pt'(기본)/'cm'/'mm'/'in'.
+        text: 도형 안에 넣을 텍스트(선택).
+        fill_color: 배경색 '#RRGGBB'(선택).
+        path: 파일 경로. 생략하면 활성 발표자료. **PowerPoint에 열려 있어야 합니다.**
+
+    Returns:
+        새로 만든 도형의 번호·이름·위치·크기와 저장 안내.
+    """
+    key = str(shape_type).strip().lower()
+    if key not in PPT_AUTO_SHAPES:
+        valid = ", ".join(sorted(k for k in PPT_AUTO_SHAPES if k.isascii()))
+        raise OfficeError(f"shape_type '{shape_type}'을(를) 모릅니다. 지원: {valid}")
+    pres = _writable_presentation(path)
+    slide_obj = _resolve_slide(pres, slide)
+    try:
+        shape = slide_obj.Shapes.AddShape(
+            PPT_AUTO_SHAPES[key],
+            _to_points(left, unit), _to_points(top, unit),
+            _to_points(width, unit), _to_points(height, unit),
+        )
+    except pythoncom.com_error as e:
+        raise OfficeError(f"'{shape_type}' 도형을 만들지 못했습니다: {_com_message(e)}")
+    if text:
+        try:
+            shape.TextFrame.TextRange.Text = str(text).replace("\r\n", "\n").replace("\n", "\r")
+        except Exception:  # noqa: BLE001
+            pass
+    if fill_color:
+        try:
+            shape.Fill.Solid()
+            shape.Fill.ForeColor.RGB = _hex_to_ole(fill_color)
+        except OfficeError:
+            raise
+        except Exception:  # noqa: BLE001
+            pass
+    return _report_new_shape(shape, slide, pres, path, f"도형({key})")
+
+
+@mcp.tool()
+@office_tool
+def add_slide(path: str = "", layout: str = "blank", index: int = 0, title: str = "") -> str:
+    """🟡 발표자료에 새 슬라이드를 추가합니다 (저장하지 않음).
+
+    빈/제목만/제목+내용 등 레이아웃을 골라 슬라이드를 끼워 넣습니다. 디스크에는
+    쓰지 않으며(저장은 save_presentation), Ctrl+Z로 되돌릴 수 있습니다.
+
+    Args:
+        path: 파일 경로. 생략하면 활성 발표자료. **PowerPoint에 열려 있어야 합니다.**
+        layout: 레이아웃. 'blank'(기본)/'title'/'title_only'/'text'/'two_column'/'object'
+            (한글 별칭: '빈','제목','제목만','제목과내용' 등).
+        index: 삽입 위치(1부터). 0(기본)이면 맨 끝에 추가합니다.
+        title: 제목 개체틀이 있으면 채울 제목 텍스트(선택).
+
+    Returns:
+        새 슬라이드 번호·레이아웃과 저장 안내.
+    """
+    key = str(layout).strip().lower()
+    if key not in PPT_SLIDE_LAYOUTS:
+        valid = ", ".join(sorted(k for k in PPT_SLIDE_LAYOUTS if k.isascii()))
+        raise OfficeError(f"layout '{layout}'을(를) 모릅니다. 지원: {valid}")
+    pres = _writable_presentation(path)
+    total = pres.Slides.Count
+    pos = total + 1 if not index or int(index) < 1 else min(int(index), total + 1)
+    slide_obj = pres.Slides.Add(pos, PPT_SLIDE_LAYOUTS[key])
+    if title:
+        try:
+            if slide_obj.Shapes.HasTitle:
+                slide_obj.Shapes.Title.TextFrame.TextRange.Text = str(title)
+        except Exception:  # noqa: BLE001
+            pass
+    return (
+        f"슬라이드 추가: {pos}번 (레이아웃 {key}) — 이제 전체 {pres.Slides.Count}장 "
+        f"(발표자료: {_doc_label(pres, path)})\n"
+        + (f"  제목: {title}\n" if title else "")
+        + "아직 저장하지 않았습니다 — 파일에 반영하려면 save_presentation을 호출하세요."
+    )
+
+
+@mcp.tool()
+@office_tool
+def delete_shape(slide: int, shape: str, path: str = "") -> str:
+    """🟡 슬라이드에서 도형 하나를 지웁니다 (저장하지 않음).
+
+    잘못 넣었거나 필요 없는 도형을 제거할 때 씁니다. 디스크에는 쓰지 않으므로
+    (저장은 save_presentation) 저장 전 PowerPoint에서 Ctrl+Z로 되돌릴 수 있습니다.
+    저장까지 하면 되돌리기 어려우니 주의하세요.
+
+    Args:
+        slide: 슬라이드 번호(1부터).
+        shape: 지울 도형의 번호 또는 이름(list_slide_shapes로 확인).
+        path: 파일 경로. 생략하면 활성 발표자료. **PowerPoint에 열려 있어야 합니다.**
+
+    Returns:
+        지운 도형 요약과 저장 안내.
+    """
+    pres = _writable_presentation(path)
+    slide_obj = _resolve_slide(pres, slide)
+    shape_obj = _resolve_shape(slide_obj, shape)
+    name = shape_obj.Name
+    kind = _shape_kind(shape_obj)
+    shape_obj.Delete()
+    return (
+        f"도형 삭제: 슬라이드 {slide} / '{name}' ({kind})  (발표자료: {_doc_label(pres, path)})\n"
+        "아직 저장하지 않았습니다 — 파일에 반영하려면 save_presentation을, 되돌리려면 "
+        "PowerPoint에서 Ctrl+Z를 쓰세요."
+    )
+
+
+@mcp.tool()
+@office_tool
+def save_presentation(path: str = "", confirm: bool = False) -> str:
+    """🔴 열려 있는 발표자료를 현재 경로에 저장합니다(덮어쓰기). (confirm=True 필요)
+
+    set_powerpoint_text/add_shape 등으로 바꾼 내용을 디스크에 반영하는 단계입니다.
+    confirm 없이 부르면 어떤 파일을 덮어쓸지 프리뷰만 돌려줍니다.
+
+    Args:
+        path: 파일 경로. 생략하면 활성 발표자료. PowerPoint에 열려 있어야 합니다.
+        confirm: 실제 저장하려면 True. 없으면 프리뷰만.
+    """
+    pres = _writable_presentation(path)
+    try:
+        full = pres.FullName
+    except Exception:  # noqa: BLE001
+        full = ""
+    if not full or not os.path.isabs(str(full).replace("/", os.sep)):
+        return (
+            "이 발표자료는 아직 디스크에 저장된 적이 없어 경로가 없습니다. "
+            "PowerPoint에서 먼저 '다른 이름으로 저장'해 경로를 정하세요."
+        )
+    changed = ""
+    try:
+        changed = "변경 없음(이미 저장됨)" if bool(pres.Saved) else "변경 있음(미저장)"
+    except Exception:  # noqa: BLE001
+        pass
+    if not confirm:
+        details = [f"발표자료: {pres.Name}", f"경로: {full} (덮어쓰기)"]
+        if changed:
+            details.append(f"상태: {changed}")
+        return _preview("발표자료 저장(덮어쓰기)", details, "(save_presentation ... confirm=true)")
+    pres.Save()
+    return f"저장 완료.\n  경로: {full}"
 
 
 if __name__ == "__main__":
